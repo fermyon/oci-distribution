@@ -12,18 +12,15 @@ authors = [
 ]
 description = "An OCI implementation in Rust"
 edition = "2021"
-keywords = [
-  "oci",
-  "containers",
-]
+keywords = ["oci", "containers"]
 license = "Apache-2.0"
 name = "oci-distribution"
 readme = "README.md"
 repository = "https://github.com/krustlet/oci-distribution"
-version = "0.10.0"
+version = "0.11.0"
 
 [badges]
-maintenance = {status = "actively-developed"}
+maintenance = { status = "actively-developed" }
 
 [features]
 default = ["native-tls", "test-registry"]
@@ -38,13 +35,16 @@ test-registry = []
 bytes = "1"
 chrono = { version = "0.4.23", features = ["serde"] }
 futures-util = "0.3"
-http = "0.2"
+http = "1.1"
 http-auth = { version = "0.1", default_features = false }
 jwt = "0.16"
 lazy_static = "1.4"
 olpc-cjson = "0.1"
 regex = "1.6"
-reqwest = { version = "0.11", default-features = false, features = ["json", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = [
+  "json",
+  "stream",
+] }
 serde_json = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 sha2 = "0.10"
@@ -63,6 +63,6 @@ docker_credential = "1.0"
 hmac = "0.12"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tempfile = "3.3"
-testcontainers = "0.14"
+testcontainers = "0.15"
 tokio = { version = "1.21", features = ["macros", "fs", "rt-multi-thread"] }
 tokio-util = { version = "0.7.4", features = ["compat"] }

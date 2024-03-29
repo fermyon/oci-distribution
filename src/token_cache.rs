@@ -4,7 +4,9 @@ use crate::reference::Reference;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::fmt;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::sync::RwLock;
 use tracing::{debug, warn};
 
 /// A token granted during the OAuth2-like workflow for OCI registries.
@@ -15,12 +17,12 @@ pub enum RegistryToken {
     /// Token value
     Token {
         /// The string value of the token
-        token: String
+        token: String,
     },
     /// AccessToken value
     AccessToken {
         /// The string value of the access_token
-        access_token: String
+        access_token: String,
     },
 }
 
@@ -40,7 +42,7 @@ impl fmt::Debug for RegistryToken {
 }
 
 /// Type of registry auth token
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum RegistryTokenType {
     /// Bearer token type
     Bearer(RegistryToken),
@@ -71,23 +73,29 @@ pub enum RegistryOperation {
     Pull,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct TokenCacheKey {
+    registry: String,
+    repository: String,
+    operation: RegistryOperation,
+}
+
+struct TokenCacheValue {
+    token: RegistryTokenType,
+    expiration: u64,
+}
+
 /// A cache to hold authentication tokens
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct TokenCache {
     // (registry, repository, scope) -> (token, expiration)
-    tokens: BTreeMap<(String, String, RegistryOperation), (RegistryTokenType, u64)>,
+    tokens: Arc<RwLock<BTreeMap<TokenCacheKey, TokenCacheValue>>>,
 }
 
 impl TokenCache {
-    pub(crate) fn new() -> Self {
-        TokenCache {
-            tokens: BTreeMap::new(),
-        }
-    }
-
     /// Insert a token corresponding to reference and operation keys
-    pub fn insert(
-        &mut self,
+    pub async fn insert(
+        &self,
         reference: &Reference,
         op: RegistryOperation,
         token: RegistryTokenType,
@@ -131,40 +139,50 @@ impl TokenCache {
         let registry = reference.resolve_registry().to_string();
         let repository = reference.repository().to_string();
         debug!(%registry, %repository, ?op, %expiration, "Inserting token");
-        self.tokens
-            .insert((registry, repository, op), (token, expiration));
+        self.tokens.write().await.insert(
+            TokenCacheKey {
+                registry,
+                repository,
+                operation: op,
+            },
+            TokenCacheValue { token, expiration },
+        );
     }
 
-    pub(crate) fn get(
+    pub(crate) async fn get(
         &self,
         reference: &Reference,
         op: RegistryOperation,
-    ) -> Option<&RegistryTokenType> {
+    ) -> Option<RegistryTokenType> {
         let registry = reference.resolve_registry().to_string();
         let repository = reference.repository().to_string();
-        match self.tokens.get(&(registry.clone(), repository.clone(), op)) {
-            Some((ref token, expiration)) => {
+        let key = TokenCacheKey {
+            registry,
+            repository,
+            operation: op,
+        };
+        match self.tokens.read().await.get(&key) {
+            Some(TokenCacheValue {
+                ref token,
+                expiration,
+            }) => {
                 let now = SystemTime::now();
                 let epoch = now
                     .duration_since(UNIX_EPOCH)
                     .expect("Time went backwards")
                     .as_secs();
                 if epoch > *expiration {
-                    debug!(%registry, %repository, ?op, %expiration, miss=false, expired=true, "Fetching token");
+                    debug!(%key.registry, %key.repository, ?key.operation, %expiration, miss=false, expired=true, "Fetching token");
                     None
                 } else {
-                    debug!(%registry, %repository, ?op, %expiration, miss=false, expired=false, "Fetching token");
-                    Some(token)
+                    debug!(%key.registry, %key.repository, ?key.operation, %expiration, miss=false, expired=false, "Fetching token");
+                    Some(token.clone())
                 }
             }
             None => {
-                debug!(%registry, %repository, ?op, miss=true, "Fetching token");
+                debug!(%key.registry, %key.repository, ?key.operation, miss = true, "Fetching token");
                 None
             }
         }
-    }
-
-    pub(crate) fn contains_key(&self, reference: &Reference, op: RegistryOperation) -> bool {
-        self.get(reference, op).is_some()
     }
 }
