@@ -37,7 +37,9 @@ chrono = { version = "0.4.23", features = ["serde"] }
 futures-util = "0.3"
 http = "1.1"
 http-auth = { version = "0.1", default_features = false }
-jwt = "0.16"
+# Fork incorporating needed fix not yet merged upstream:
+# https://github.com/mikkyang/rust-jwt/pull/86
+jwt = { git = "https://github.com/vdice/rust-jwt", rev = "c5b596d28a39dd428350b445d5c5829ba6352f02" }
 lazy_static = "1.4"
 olpc-cjson = "0.1"
 regex = "1.6"
