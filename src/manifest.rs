@@ -1,6 +1,8 @@
 //! OCI Manifest
 use std::collections::BTreeMap;
 
+use oci_spec::image::{Arch, Os};
+
 use crate::{
     client::{Config, ImageLayer},
     sha256_digest,
@@ -42,6 +44,7 @@ pub const IMAGE_LAYER_NONDISTRIBUTABLE_GZIP_MEDIA_TYPE: &str =
 /// An image, or image index, OCI manifest
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
 #[serde(untagged)]
+#[allow(clippy::large_enum_variant)]
 pub enum OciManifest {
     /// An OCI image manifest
     Image(OciImageManifest),
@@ -95,6 +98,15 @@ pub struct OciImageManifest {
     /// required, assuming an empty vector can be used if necessary.
     pub layers: Vec<OciDescriptor>,
 
+    /// This is an optional subject linking this manifest to another manifest
+    /// forming an association between the image manifest and the other manifest.
+    ///
+    /// NOTE: The responsibility of implementing the fall back mechanism when encountering
+    /// a registry with an [unavailable referrers API](https://github.com/opencontainers/distribution-spec/blob/main/spec.md#referrers-tag-schema)
+    /// falls on the consumer of the client.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subject: Option<OciDescriptor>,
+
     /// The OCI artifact type
     ///
     /// This OPTIONAL property contains the type of an artifact when the manifest is used for an
@@ -123,6 +135,7 @@ impl Default for OciImageManifest {
             media_type: None,
             config: OciDescriptor::default(),
             layers: vec![],
+            subject: None,
             artifact_type: None,
             annotations: None,
         }
@@ -178,8 +191,8 @@ impl From<OciImageManifest> for OciManifest {
 impl std::fmt::Display for OciManifest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            OciManifest::Image(oci_image_manifest) => write!(f, "{}", oci_image_manifest),
-            OciManifest::ImageIndex(oci_image_index) => write!(f, "{}", oci_image_index),
+            OciManifest::Image(oci_image_manifest) => write!(f, "{oci_image_manifest}"),
+            OciManifest::ImageIndex(oci_image_index) => write!(f, "{oci_image_index}"),
         }
     }
 }
@@ -239,7 +252,9 @@ pub struct Versioned {
 
 /// The OCI descriptor is a generic object used to describe other objects.
 ///
-/// It is defined in the [OCI Image Specification](https://github.com/opencontainers/image-spec/blob/main/descriptor.md#properties):
+/// It is defined in the [OCI Image Specification][descriptor]:
+///
+/// [descriptor]: https://github.com/opencontainers/image-spec/blob/v1.1.1/descriptor.md
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OciDescriptor {
@@ -277,6 +292,21 @@ pub struct OciDescriptor {
     /// <https://github.com/opencontainers/image-spec/blob/main/annotations.md#rules>
     #[serde(skip_serializing_if = "Option::is_none")]
     pub annotations: Option<BTreeMap<String, String>>,
+
+    /// This OPTIONAL property contains the type of an artifact when the descriptor
+    /// points to an artifact.
+    ///
+    /// This is the value of the config descriptor `mediaType` when the descriptor
+    /// references an [image manifest][manifest]. If defined, the value MUST comply
+    /// with [RFC 6838][rfc6838], including the [naming requirements in its section 4.2][rfc6838-s4.2],
+    /// and MAY be registered with [IANA][iana].
+    ///
+    /// [manifest]: https://github.com/opencontainers/image-spec/blob/v1.1.1/manifest.md
+    /// [rfc6838]: https://tools.ietf.org/html/rfc6838
+    /// [rfc6838-s4.2]: https://tools.ietf.org/html/rfc6838#section-4.2
+    /// [iana]: https://www.iana.org/assignments/media-types/media-types.xhtml
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifact_type: Option<String>,
 }
 
 impl std::fmt::Display for OciDescriptor {
@@ -286,8 +316,9 @@ impl std::fmt::Display for OciDescriptor {
 
         write!(
             f,
-            "( media-type: '{}', digest: '{}', size: '{}', urls: '{:?}', annotations: '{:?}' )",
-            self.media_type, self.digest, self.size, urls, annotations,
+            "( media-type: '{}', digest: '{}', size: '{}', urls: '{:?}', \
+            annotations: '{:?}', artifact_type: '{:?}' )",
+            self.media_type, self.digest, self.size, urls, annotations, self.artifact_type
         )
     }
 }
@@ -300,6 +331,7 @@ impl Default for OciDescriptor {
             size: 0,
             urls: None,
             annotations: None,
+            artifact_type: None,
         }
     }
 }
@@ -328,6 +360,10 @@ pub struct OciImageIndex {
     /// The spec says this field must be present but the value may be an empty array.
     pub manifests: Vec<ImageIndexEntry>,
 
+    /// This property contains the type of an artifact when the manifest is used for an artifact.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifact_type: Option<String>,
+
     /// The annotations for this manifest
     ///
     /// The specification says "If there are no annotations then this property
@@ -340,7 +376,9 @@ pub struct OciImageIndex {
 /// The manifest entry of an `ImageIndex`.
 ///
 /// It is part of the OCI specification, and is defined in the `manifests`
-/// section [here](https://github.com/opencontainers/image-spec/blob/main/image-index.md#image-index-property-descriptions):
+/// section [here][image-index]:
+///
+/// [image-index]: https://github.com/opencontainers/image-spec/blob/v1.1.1/image-index.md#image-index-property-descriptions
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ImageIndexEntry {
@@ -376,6 +414,16 @@ pub struct ImageIndexEntry {
     /// This OPTIONAL property MUST use the [annotation rules](https://github.com/opencontainers/image-spec/blob/main/annotations.md#rules).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub annotations: Option<BTreeMap<String, String>>,
+
+    /// This OPTIONAL property contains the type of an artifact.
+    ///
+    /// Used in the referrers list (from the OCI Distribution Spec referrers API
+    /// or the referrers tag schema) to identify the kind of artifact each entry
+    /// represents.
+    ///
+    /// See [`OciDescriptor::artifact_type`] for more information.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifact_type: Option<String>,
 }
 
 impl std::fmt::Display for ImageIndexEntry {
@@ -389,8 +437,8 @@ impl std::fmt::Display for ImageIndexEntry {
 
         write!(
             f,
-            "(media-type: '{}', digest: '{}', size: '{}', platform: '{}', annotations: {:?})",
-            self.media_type, self.digest, self.size, platform, annotations,
+            "(media-type: '{}', digest: '{}', size: '{}', platform: '{}', annotations: {:?}, artifact_type: '{:?}')",
+            self.media_type, self.digest, self.size, platform, annotations, self.artifact_type,
         )
     }
 }
@@ -405,11 +453,11 @@ pub struct Platform {
     /// This REQUIRED property specifies the CPU architecture.
     /// Image indexes SHOULD use, and implementations SHOULD understand, values
     /// listed in the Go Language document for [`GOARCH`](https://golang.org/doc/install/source#environment).
-    pub architecture: String,
+    pub architecture: Arch,
     /// This REQUIRED property specifies the operating system.
     /// Image indexes SHOULD use, and implementations SHOULD understand, values
     /// listed in the Go Language document for [`GOOS`](https://golang.org/doc/install/source#environment).
-    pub os: String,
+    pub os: Os,
     /// This OPTIONAL property specifies the version of the operating system
     /// targeted by the referenced blob.
     /// Implementations MAY refuse to use manifests where `os.version` is not known
@@ -421,6 +469,7 @@ pub struct Platform {
     /// This OPTIONAL property specifies an array of strings, each specifying a mandatory OS feature.
     /// When `os` is `windows`, image indexes SHOULD use, and implementations SHOULD understand the following values:
     /// - `win32k`: image requires `win32k.sys` on the host (Note: `win32k.sys` is missing on Nano Server)
+    ///
     /// When `os` is not `windows`, values are implementation-defined and SHOULD be submitted to this specification for standardization.
     #[serde(rename = "os.features")]
     #[serde(skip_serializing_if = "Option::is_none")]

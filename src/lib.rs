@@ -4,26 +4,36 @@
 use sha2::Digest;
 
 pub mod annotations;
+mod blob;
 pub mod client;
 pub mod config;
+pub(crate) mod digest;
 pub mod errors;
 pub mod manifest;
-mod reference;
-mod regexp;
 pub mod secrets;
 pub mod token_cache;
 
 #[doc(inline)]
 pub use client::Client;
 #[doc(inline)]
-pub use reference::{ParseError, Reference};
+pub use oci_spec::distribution::{ParseError, Reference};
 #[doc(inline)]
 pub use token_cache::RegistryOperation;
 
-#[macro_use]
-extern crate lazy_static;
-
 /// Computes the SHA256 digest of a byte vector
 pub(crate) fn sha256_digest(bytes: &[u8]) -> String {
-    format!("sha256:{:x}", sha2::Sha256::digest(bytes))
+    format!("sha256:{}", hex::encode(sha2::Sha256::digest(bytes)))
+}
+
+#[cfg(test)]
+mod test_helpers {
+    use std::sync::OnceLock;
+
+    static PROVIDER_INIT: OnceLock<()> = OnceLock::new();
+
+    pub(crate) fn jsonwebtoken_install_default_crypto_provider() {
+        PROVIDER_INIT.get_or_init(|| {
+            let _ = jsonwebtoken::crypto::aws_lc::DEFAULT_PROVIDER.install_default();
+        });
+    }
 }

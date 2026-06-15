@@ -1,9 +1,29 @@
-//! OCI distribution client
-//!
-//! *Note*: This client is very feature poor. We hope to expand this to be a complete
-//! OCI distribution client in the future.
+//! OCI distribution client for fetching oci images from an OCI compliant remote store
+use std::collections::{BTreeMap, HashMap};
+use std::convert::TryFrom;
+use std::hash::Hash;
+use std::pin::pin;
+use std::sync::Arc;
+use std::time::Duration;
 
+use futures_util::stream::{self, BoxStream, StreamExt, TryStreamExt};
+use futures_util::{future, Stream};
+use http::header::RANGE;
+use http::{HeaderValue, StatusCode};
+use http_auth::{parser::ChallengeParser, ChallengeRef};
+use oci_spec::image::{Arch, Os};
+use olpc_cjson::CanonicalFormatter;
+use reqwest::header::HeaderMap;
+use reqwest::{NoProxy, Proxy, RequestBuilder, Response, Url};
+use serde::Deserialize;
+use serde::Serialize;
+use tokio::io::{AsyncWrite, AsyncWriteExt};
+use tokio::sync::RwLock;
+use tracing::{debug, trace, warn};
+
+pub use crate::blob::*;
 use crate::config::ConfigFile;
+use crate::digest::{digest_header_value, validate_digest, Digest, Digester};
 use crate::errors::*;
 use crate::manifest::{
     ImageIndexEntry, OciDescriptor, OciImageIndex, OciImageManifest, OciManifest, Versioned,
@@ -14,28 +34,8 @@ use crate::manifest::{
 use crate::secrets::RegistryAuth;
 use crate::secrets::*;
 use crate::sha256_digest;
-use crate::Reference;
-
-use crate::errors::{OciDistributionError, Result};
 use crate::token_cache::{RegistryOperation, RegistryToken, RegistryTokenType, TokenCache};
-use futures_util::future;
-use futures_util::stream::{self, StreamExt, TryStreamExt};
-use futures_util::Stream;
-use http::HeaderValue;
-use http_auth::{parser::ChallengeParser, ChallengeRef};
-use olpc_cjson::CanonicalFormatter;
-use reqwest::header::HeaderMap;
-use reqwest::{RequestBuilder, Url};
-use serde::Deserialize;
-use serde::Serialize;
-use sha2::Digest;
-use std::collections::{BTreeMap, HashMap};
-use std::convert::TryFrom;
-use std::hash::Hash;
-use std::sync::Arc;
-use tokio::io::{AsyncWrite, AsyncWriteExt};
-use tokio::sync::RwLock;
-use tracing::{debug, trace, warn};
+use crate::Reference;
 
 const MIME_TYPES_DISTRIBUTION_MANIFEST: &[&str] = &[
     IMAGE_MANIFEST_MEDIA_TYPE,
@@ -54,6 +54,8 @@ pub const DEFAULT_MAX_CONCURRENT_DOWNLOAD: usize = 16;
 
 /// Default value for `ClientConfig:default_token_expiration_secs`
 pub const DEFAULT_TOKEN_EXPIRATION_SECS: usize = 60;
+
+static DEFAULT_USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
 
 /// The data for an image or module.
 #[derive(Clone)]
@@ -86,11 +88,65 @@ pub struct TagResponse {
     pub tags: Vec<String>,
 }
 
+/// The data returned by a successful catalog request.
+#[derive(Deserialize, Debug)]
+pub struct CatalogResponse {
+    /// List of available repositories in the registry.
+    pub repositories: Vec<String>,
+}
+
+/// Layer descriptor required to pull a layer
+pub struct LayerDescriptor<'a> {
+    /// The digest of the layer
+    pub digest: &'a str,
+    /// Optional list of additional URIs to pull the layer from
+    pub urls: &'a Option<Vec<String>>,
+}
+
+/// A trait for converting any type into a [`LayerDescriptor`]
+pub trait AsLayerDescriptor {
+    /// Convert the type to a LayerDescriptor reference
+    fn as_layer_descriptor(&self) -> LayerDescriptor<'_>;
+}
+
+impl<T: AsLayerDescriptor> AsLayerDescriptor for &T {
+    fn as_layer_descriptor(&self) -> LayerDescriptor<'_> {
+        (*self).as_layer_descriptor()
+    }
+}
+
+impl AsLayerDescriptor for &str {
+    fn as_layer_descriptor(&self) -> LayerDescriptor<'_> {
+        LayerDescriptor {
+            digest: self,
+            urls: &None,
+        }
+    }
+}
+
+impl AsLayerDescriptor for &OciDescriptor {
+    fn as_layer_descriptor(&self) -> LayerDescriptor<'_> {
+        LayerDescriptor {
+            digest: &self.digest,
+            urls: &self.urls,
+        }
+    }
+}
+
+impl AsLayerDescriptor for &LayerDescriptor<'_> {
+    fn as_layer_descriptor(&self) -> LayerDescriptor<'_> {
+        LayerDescriptor {
+            digest: self.digest,
+            urls: self.urls,
+        }
+    }
+}
+
 /// The data and media type for an image layer
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct ImageLayer {
     /// The data of this layer
-    pub data: Vec<u8>,
+    pub data: bytes::Bytes,
     /// The media type of this layer
     pub media_type: String,
     /// This OPTIONAL property contains arbitrary metadata for this descriptor.
@@ -101,12 +157,12 @@ pub struct ImageLayer {
 impl ImageLayer {
     /// Constructs a new ImageLayer struct with provided data and media type
     pub fn new(
-        data: Vec<u8>,
+        data: impl Into<bytes::Bytes>,
         media_type: String,
         annotations: Option<BTreeMap<String, String>>,
     ) -> Self {
         ImageLayer {
-            data,
+            data: data.into(),
             media_type,
             annotations,
         }
@@ -114,12 +170,18 @@ impl ImageLayer {
 
     /// Constructs a new ImageLayer struct with provided data and
     /// media type application/vnd.oci.image.layer.v1.tar
-    pub fn oci_v1(data: Vec<u8>, annotations: Option<BTreeMap<String, String>>) -> Self {
+    pub fn oci_v1(
+        data: impl Into<bytes::Bytes>,
+        annotations: Option<BTreeMap<String, String>>,
+    ) -> Self {
         Self::new(data, IMAGE_LAYER_MEDIA_TYPE.to_string(), annotations)
     }
     /// Constructs a new ImageLayer struct with provided data and
     /// media type application/vnd.oci.image.layer.v1.tar+gzip
-    pub fn oci_v1_gzip(data: Vec<u8>, annotations: Option<BTreeMap<String, String>>) -> Self {
+    pub fn oci_v1_gzip(
+        data: impl Into<bytes::Bytes>,
+        annotations: Option<BTreeMap<String, String>>,
+    ) -> Self {
         Self::new(data, IMAGE_LAYER_GZIP_MEDIA_TYPE.to_string(), annotations)
     }
 
@@ -133,7 +195,7 @@ impl ImageLayer {
 #[derive(Clone)]
 pub struct Config {
     /// The data of this config object
-    pub data: Vec<u8>,
+    pub data: bytes::Bytes,
     /// The media type of this object
     pub media_type: String,
     /// This OPTIONAL property contains arbitrary metadata for this descriptor.
@@ -144,12 +206,12 @@ pub struct Config {
 impl Config {
     /// Constructs a new Config struct with provided data and media type
     pub fn new(
-        data: Vec<u8>,
+        data: impl Into<bytes::Bytes>,
         media_type: String,
         annotations: Option<BTreeMap<String, String>>,
     ) -> Self {
         Config {
-            data,
+            data: data.into(),
             media_type,
             annotations,
         }
@@ -157,7 +219,10 @@ impl Config {
 
     /// Constructs a new Config struct with provided data and
     /// media type application/vnd.oci.image.config.v1+json
-    pub fn oci_v1(data: Vec<u8>, annotations: Option<BTreeMap<String, String>>) -> Self {
+    pub fn oci_v1(
+        data: impl Into<bytes::Bytes>,
+        annotations: Option<BTreeMap<String, String>>,
+    ) -> Self {
         Self::new(data, IMAGE_CONFIG_MEDIA_TYPE.to_string(), annotations)
     }
 
@@ -185,7 +250,7 @@ impl TryFrom<Config> for ConfigFile {
     type Error = crate::errors::OciDistributionError;
 
     fn try_from(config: Config) -> Result<Self> {
-        let config = String::from_utf8(config.data)
+        let config = String::from_utf8(config.data.into())
             .map_err(|e| OciDistributionError::ConfigConversionError(e.to_string()))?;
         let config_file: ConfigFile = serde_json::from_str(&config)
             .map_err(|e| OciDistributionError::ConfigConversionError(e.to_string()))?;
@@ -200,7 +265,7 @@ impl TryFrom<Config> for ConfigFile {
 /// provides a native Rust implementation for pulling OCI images.
 ///
 /// Some OCI registries support completely anonymous access. But most require
-/// at least an Oauth2 handshake. Typlically, you will want to create a new
+/// at least an Oauth2 handshake. Typically, you will want to create a new
 /// client, and then run the `auth()` method, which will attempt to get
 /// a read-only bearer token. From there, pulling images can be done with
 /// the `pull_*` functions.
@@ -256,12 +321,40 @@ impl TryFrom<ClientConfig> for Client {
         };
 
         #[cfg(not(target_arch = "wasm32"))]
-        for c in &config.extra_root_certificates {
-            let cert = match c.encoding {
-                CertificateEncoding::Der => reqwest::Certificate::from_der(c.data.as_slice())?,
-                CertificateEncoding::Pem => reqwest::Certificate::from_pem(c.data.as_slice())?,
-            };
-            client_builder = client_builder.add_root_certificate(cert);
+        {
+            if !config.tls_certs_only.is_empty() {
+                client_builder =
+                    client_builder.tls_certs_only(convert_certificates(&config.tls_certs_only)?);
+            }
+            client_builder = client_builder
+                .tls_certs_merge(convert_certificates(&config.extra_root_certificates)?);
+        }
+
+        if let Some(timeout) = config.read_timeout {
+            client_builder = client_builder.read_timeout(timeout);
+        }
+        if let Some(timeout) = config.connect_timeout {
+            client_builder = client_builder.connect_timeout(timeout);
+        }
+
+        client_builder = client_builder.user_agent(config.user_agent);
+
+        if let Some(proxy_addr) = &config.https_proxy {
+            let no_proxy = config
+                .no_proxy
+                .as_ref()
+                .and_then(|no_proxy| NoProxy::from_string(no_proxy));
+            let proxy = Proxy::https(proxy_addr)?.no_proxy(no_proxy);
+            client_builder = client_builder.proxy(proxy);
+        }
+
+        if let Some(proxy_addr) = &config.http_proxy {
+            let no_proxy = config
+                .no_proxy
+                .as_ref()
+                .and_then(|no_proxy| NoProxy::from_string(no_proxy));
+            let proxy = Proxy::http(proxy_addr)?.no_proxy(no_proxy);
+            client_builder = client_builder.proxy(proxy);
         }
 
         let default_token_expiration_secs = config.default_token_expiration_secs;
@@ -306,7 +399,15 @@ impl Client {
         self.auth_store.read().await.contains_key(registry)
     }
 
-    async fn store_auth_if_needed(&self, registry: &str, auth: &RegistryAuth) {
+    /// Store the authentication information for this registry if it's not already stored in the client.
+    ///
+    /// Most of the time, you don't need to call this method directly. It's called by other
+    /// methods (where you have to provide the authentication information as parameter).
+    ///
+    /// But if you want to pull/push a blob without calling any of the other methods first, which would
+    /// store the authentication information, you can call this method to store the authentication
+    /// information manually.
+    pub async fn store_auth_if_needed(&self, registry: &str, auth: &RegistryAuth) {
         if !self.is_stored_auth(registry).await {
             self.store_auth(registry, auth.clone()).await;
         }
@@ -425,6 +526,33 @@ impl Client {
         })
     }
 
+    /// Checks if a blob exists in the remote registry
+    pub async fn blob_exists(&self, image: &Reference, digest: &str) -> Result<bool> {
+        let url = self.to_v2_blob_url(image, digest);
+        let request = RequestBuilderWrapper {
+            client: self,
+            request_builder: self.client.head(&url),
+        };
+
+        let res = request
+            .apply_auth(image, RegistryOperation::Pull)
+            .await?
+            .into_request_builder()
+            .send()
+            .await?;
+
+        match res.error_for_status() {
+            Ok(_) => Ok(true),
+            Err(err) => {
+                if err.status() == Some(StatusCode::NOT_FOUND) {
+                    Ok(false)
+                } else {
+                    Err(err.into())
+                }
+            }
+        }
+    }
+
     /// Push an image and return the uploaded URL of the image
     ///
     /// The client will check if it's already been authenticated and if
@@ -460,7 +588,8 @@ impl Client {
                 let this = &self;
                 async move {
                     let digest = layer.sha256_digest();
-                    this.push_blob(image_ref, &layer.data, &digest).await?;
+                    this.push_blob(image_ref, layer.data.clone(), &digest)
+                        .await?;
                     Result::Ok(())
                 }
             })
@@ -470,7 +599,7 @@ impl Client {
             .await?;
 
         let config_url = self
-            .push_blob(image_ref, &config.data, &manifest.config.digest)
+            .push_blob(image_ref, config.data, &manifest.config.digest)
             .await?;
         let manifest_url = self.push_manifest(image_ref, &manifest.into()).await?;
 
@@ -484,10 +613,20 @@ impl Client {
     pub async fn push_blob(
         &self,
         image_ref: &Reference,
-        data: &[u8],
+        data: impl Into<bytes::Bytes>,
         digest: &str,
     ) -> Result<String> {
-        match self.push_blob_chunked(image_ref, data, digest).await {
+        if self.config.use_monolithic_push {
+            return self.push_blob_monolithically(image_ref, data, digest).await;
+        }
+        let data = data.into();
+        // Cloning the bytes here is cheap (e.g. doesn't allocate anything except some space for
+        // some pointers). If any cloning happened, it is because the caller's passed data was not
+        // already a `Bytes` type or static data.
+        match self
+            .push_blob_chunked(image_ref, data.clone(), digest)
+            .await
+        {
             Ok(url) => Ok(url),
             Err(OciDistributionError::SpecViolationError(violation)) => {
                 warn!(?violation, "Registry is not respecting the OCI Distribution Specification when doing chunked push operations");
@@ -504,7 +643,7 @@ impl Client {
     async fn push_blob_monolithically(
         &self,
         image: &Reference,
-        blob_data: &[u8],
+        blob_data: impl Into<bytes::Bytes>,
         blob_digest: &str,
     ) -> Result<String> {
         let location = self.begin_push_monolithical_session(image).await?;
@@ -518,15 +657,43 @@ impl Client {
     async fn push_blob_chunked(
         &self,
         image: &Reference,
-        blob_data: &[u8],
+        blob_data: impl Into<bytes::Bytes>,
         blob_digest: &str,
     ) -> Result<String> {
         let mut location = self.begin_push_chunked_session(image).await?;
         let mut start: usize = 0;
-        loop {
-            (location, start) = self.push_chunk(&location, image, blob_data, start).await?;
-            if start >= blob_data.len() {
-                break;
+
+        let mut blob_data: bytes::Bytes = blob_data.into();
+        while !blob_data.is_empty() {
+            let chunk_size = self.push_chunk_size.min(blob_data.len());
+            let chunk = blob_data.split_to(chunk_size);
+            (location, start) = self.push_chunk(&location, image, chunk, start).await?;
+        }
+        self.end_push_chunked_session(&location, image, blob_digest)
+            .await
+    }
+
+    /// Pushes a blob to the registry as a series of chunks from an input stream
+    ///
+    /// Returns the pullable location of the blob
+    pub async fn push_blob_stream<T: Stream<Item = Result<bytes::Bytes>>>(
+        &self,
+        image: &Reference,
+        blob_data_stream: T,
+        blob_digest: &str,
+    ) -> Result<String> {
+        let mut location = self.begin_push_chunked_session(image).await?;
+        let mut range_start = 0;
+
+        let mut blob_data_stream = pin!(blob_data_stream);
+
+        while let Some(blob_data) = blob_data_stream.next().await {
+            let mut blob_data = blob_data?;
+            while !blob_data.is_empty() {
+                let chunk = blob_data.split_to(self.push_chunk_size.min(blob_data.len()));
+                (location, range_start) = self
+                    .push_chunk(&location, image, chunk, range_start)
+                    .await?;
             }
         }
         self.end_push_chunked_session(&location, image, blob_digest)
@@ -583,6 +750,13 @@ impl Client {
             image.resolve_registry()
         );
         debug!(?url);
+
+        if let RegistryAuth::Bearer(token) = authentication {
+            return Ok(Some(RegistryTokenType::Bearer(RegistryToken::Token {
+                token: token.clone(),
+            })));
+        }
+
         let res = self.client.get(&url).send().await?;
         let dist_hdr = match res.headers().get(reqwest::header::WWW_AUTHENTICATE) {
             Some(h) => h,
@@ -672,8 +846,29 @@ impl Client {
             .send()
             .await?;
 
-        trace!(headers=?res.headers(), "Got Headers");
-        if res.headers().get("Docker-Content-Digest").is_none() {
+        if let Some(digest) = digest_header_value(res.headers().clone())? {
+            let status = res.status();
+            let body = res.bytes().await?;
+            validate_registry_response(status, &body, &url)?;
+
+            // If the reference has a digest and the digest header has a matching algorithm, compare
+            // them and return an error if they don't match.
+            if let Some(img_digest) = image.digest() {
+                let header_digest = Digest::new(&digest)?;
+                let image_digest = Digest::new(img_digest)?;
+                if header_digest.algorithm == image_digest.algorithm
+                    && header_digest != image_digest
+                {
+                    return Err(DigestError::VerificationError {
+                        expected: img_digest.to_string(),
+                        actual: digest,
+                    }
+                    .into());
+                }
+            }
+
+            Ok(digest)
+        } else {
             debug!("GET image manifest from {}", url);
             let res = RequestBuilderWrapper::from_client(self, |client| client.get(&url))
                 .apply_accept(MIME_TYPES_DISTRIBUTION_MANIFEST)?
@@ -683,19 +878,13 @@ impl Client {
                 .send()
                 .await?;
             let status = res.status();
-            let headers = res.headers().clone();
-            trace!(headers=?res.headers(), "Got Headers");
-            let body = res.bytes().await?;
-            validate_registry_response(status, &body, &url)?;
-
-            digest_header_value(headers, Some(&body))
-        } else {
-            let status = res.status();
+            trace!(headers = ?res.headers(), "Got Headers");
             let headers = res.headers().clone();
             let body = res.bytes().await?;
             validate_registry_response(status, &body, &url)?;
 
-            digest_header_value(headers, None)
+            validate_digest(&body, digest_header_value(headers)?, image.digest())
+                .map_err(OciDistributionError::from)
         }
     }
 
@@ -724,7 +913,7 @@ impl Client {
     /// The client will check if it's already been authenticated and if
     /// not will attempt to do.
     ///
-    /// A Tuple is returned containing the [OciImageManifest](crate::manifest::OciImageManifest)
+    /// A Tuple is returned containing the [OciImageManifest]
     /// and the manifest content digest hash.
     ///
     /// If a multi-platform Image Index manifest is encountered, a platform-specific
@@ -740,6 +929,29 @@ impl Client {
         self._pull_image_manifest(image).await
     }
 
+    /// Pull a manifest from the remote OCI Distribution service.
+    ///
+    /// The client will check if it's already been authenticated and if
+    /// not will attempt to do.
+    ///
+    /// Returns `(image_manifest, manifest_digest, Option<manifest_list_digest>)`.
+    /// The manifest list digest is `Some` when the original reference pointed to
+    /// an image index / manifest list; `None` when it pointed directly to a
+    /// single-platform image manifest.
+    ///
+    /// If a multi-platform Image Index manifest is encountered, a platform-specific
+    /// Image manifest will be selected using the client's default platform resolution.
+    pub async fn pull_image_manifest_and_list_digest(
+        &self,
+        image: &Reference,
+        auth: &RegistryAuth,
+    ) -> Result<(OciImageManifest, String, Option<String>)> {
+        self.store_auth_if_needed(image.resolve_registry(), auth)
+            .await;
+
+        self._pull_image_manifest_and_list_digest(image).await
+    }
+
     /// Pull a manifest from the remote OCI Distribution service without parsing it.
     ///
     /// The client will check if it's already been authenticated and if
@@ -752,7 +964,7 @@ impl Client {
         image: &Reference,
         auth: &RegistryAuth,
         accepted_media_types: &[&str],
-    ) -> Result<(Vec<u8>, String)> {
+    ) -> Result<(bytes::Bytes, String)> {
         self.store_auth_if_needed(image.resolve_registry(), auth)
             .await;
 
@@ -785,29 +997,48 @@ impl Client {
     /// If a multi-platform Image Index manifest is encountered, a platform-specific
     /// Image manifest will be selected using the client's default platform resolution.
     async fn _pull_image_manifest(&self, image: &Reference) -> Result<(OciImageManifest, String)> {
+        let (manifest, digest, _list_digest) =
+            self._pull_image_manifest_and_list_digest(image).await?;
+        Ok((manifest, digest))
+    }
+
+    /// Pull an image manifest from the remote OCI Distribution service,
+    /// also returning the manifest list digest if the image is multi-arch.
+    ///
+    /// If the connection has already gone through authentication, this will
+    /// use the bearer token. Otherwise, this will attempt an anonymous pull.
+    ///
+    /// Returns `(image_manifest, manifest_digest, Option<manifest_list_digest>)`.
+    /// The manifest list digest is `Some` when the original reference pointed to
+    /// an image index / manifest list; `None` when it pointed directly to a
+    /// single-platform image manifest.
+    async fn _pull_image_manifest_and_list_digest(
+        &self,
+        image: &Reference,
+    ) -> Result<(OciImageManifest, String, Option<String>)> {
         let (manifest, digest) = self._pull_manifest(image).await?;
         match manifest {
-            OciManifest::Image(image_manifest) => Ok((image_manifest, digest)),
+            OciManifest::Image(image_manifest) => Ok((image_manifest, digest, None)),
             OciManifest::ImageIndex(image_index_manifest) => {
+                let list_digest = digest;
                 debug!("Inspecting Image Index Manifest");
-                let digest = if let Some(resolver) = &self.config.platform_resolver {
+                let platform_digest = if let Some(resolver) = &self.config.platform_resolver {
                     resolver(&image_index_manifest.manifests)
                 } else {
                     return Err(OciDistributionError::ImageIndexParsingNoPlatformResolverError);
                 };
 
-                match digest {
-                    Some(digest) => {
-                        debug!("Selected manifest entry with digest: {}", digest);
-                        let manifest_entry_reference = Reference::with_digest(
-                            image.registry().to_string(),
-                            image.repository().to_string(),
-                            digest.clone(),
-                        );
+                match platform_digest {
+                    Some(platform_digest) => {
+                        debug!("Selected manifest entry with digest: {}", platform_digest);
+                        let manifest_entry_reference =
+                            image.clone_with_digest(platform_digest.clone());
                         self._pull_manifest(&manifest_entry_reference)
                             .await
                             .and_then(|(manifest, _digest)| match manifest {
-                                OciManifest::Image(manifest) => Ok((manifest, digest)),
+                                OciManifest::Image(manifest) => {
+                                    Ok((manifest, platform_digest, Some(list_digest)))
+                                }
                                 OciManifest::ImageIndex(_) => {
                                     Err(OciDistributionError::ImageManifestNotFoundError(
                                         "received Image Index manifest instead".to_string(),
@@ -832,7 +1063,7 @@ impl Client {
         &self,
         image: &Reference,
         accepted_media_types: &[&str],
-    ) -> Result<(Vec<u8>, String)> {
+    ) -> Result<(bytes::Bytes, String)> {
         let url = self.to_v2_manifest_url(image);
         debug!("Pulling image manifest from {}", url);
 
@@ -843,15 +1074,16 @@ impl Client {
             .into_request_builder()
             .send()
             .await?;
-        let headers = res.headers().clone();
         let status = res.status();
+        let headers = res.headers().clone();
         let body = res.bytes().await?;
 
         validate_registry_response(status, &body, &url)?;
 
-        let digest = digest_header_value(headers, Some(&body))?;
+        let digest_header = digest_header_value(headers)?;
+        let digest = validate_digest(&body, digest_header, image.digest())?;
 
-        Ok((body.to_vec(), digest))
+        Ok((body, digest))
     }
 
     /// Pull a manifest from the remote OCI Distribution service.
@@ -863,20 +1095,18 @@ impl Client {
             ._pull_manifest_raw(image, MIME_TYPES_DISTRIBUTION_MANIFEST)
             .await?;
 
-        let text = std::str::from_utf8(&body)?;
+        self.validate_image_manifest(&body).await?;
 
-        self.validate_image_manifest(text).await?;
-
-        debug!("Parsing response as Manifest: {}", &text);
-        let manifest = serde_json::from_str(text)
+        debug!("Parsing response as Manifest");
+        let manifest = serde_json::from_slice(&body)
             .map_err(|e| OciDistributionError::ManifestParsingError(e.to_string()))?;
         Ok((manifest, digest))
     }
 
-    async fn validate_image_manifest(&self, text: &str) -> Result<()> {
-        debug!("validating manifest: {}", text);
-        let versioned: Versioned = serde_json::from_str(text)
+    async fn validate_image_manifest(&self, body: &[u8]) -> Result<()> {
+        let versioned: Versioned = serde_json::from_slice(body)
             .map_err(|e| OciDistributionError::VersionedParsingError(e.to_string()))?;
+        debug!(?versioned, "validating manifest");
         if versioned.schema_version != 2 {
             return Err(OciDistributionError::UnsupportedSchemaVersionError(
                 versioned.schema_version,
@@ -900,7 +1130,7 @@ impl Client {
     /// The client will check if it's already been authenticated and if
     /// not will attempt to do.
     ///
-    /// A Tuple is returned containing the [OciImageManifest](crate::manifest::OciImageManifest),
+    /// A Tuple is returned containing the [OciImageManifest],
     /// the manifest content digest hash and the contents of the manifests config layer
     /// as a String.
     pub async fn pull_manifest_and_config(
@@ -917,12 +1147,47 @@ impl Client {
                 Ok((
                     manifest,
                     digest,
-                    String::from_utf8(config.data).map_err(|e| {
+                    String::from_utf8(config.data.into()).map_err(|e| {
                         OciDistributionError::GenericError(Some(format!(
-                            "Cannot not UTF8 compliant: {}",
-                            e
+                            "Cannot parse config as UTF-8 string: {e}"
                         )))
                     })?,
+                ))
+            })
+    }
+
+    /// Pull a manifest and its config from the remote OCI Distribution service.
+    ///
+    /// The client will check if it's already been authenticated and if
+    /// not will attempt to do.
+    ///
+    /// Returns `(image_manifest, manifest_digest, config_json, Option<manifest_list_digest>)`.
+    /// The manifest list digest is `Some` when the original reference pointed to
+    /// an image index / manifest list; `None` when it pointed directly to a
+    /// single-platform image manifest.
+    ///
+    /// If a multi-platform Image Index manifest is encountered, a platform-specific
+    /// Image manifest will be selected using the client's default platform resolution.
+    pub async fn pull_manifest_and_config_and_list_digest(
+        &self,
+        image: &Reference,
+        auth: &RegistryAuth,
+    ) -> Result<(OciImageManifest, String, String, Option<String>)> {
+        self.store_auth_if_needed(image.resolve_registry(), auth)
+            .await;
+
+        self._pull_manifest_and_config_and_list_digest(image)
+            .await
+            .and_then(|(manifest, digest, config, list_digest)| {
+                Ok((
+                    manifest,
+                    digest,
+                    String::from_utf8(config.data.into()).map_err(|e| {
+                        OciDistributionError::GenericError(Some(format!(
+                            "Cannot parse config as UTF-8 string: {e}"
+                        )))
+                    })?,
+                    list_digest,
                 ))
             })
     }
@@ -931,14 +1196,30 @@ impl Client {
         &self,
         image: &Reference,
     ) -> Result<(OciImageManifest, String, Config)> {
-        let (manifest, digest) = self._pull_image_manifest(image).await?;
+        let (manifest, digest, config, _list_digest) = self
+            ._pull_manifest_and_config_and_list_digest(image)
+            .await?;
+        Ok((manifest, digest, config))
+    }
+
+    async fn _pull_manifest_and_config_and_list_digest(
+        &self,
+        image: &Reference,
+    ) -> Result<(OciImageManifest, String, Config, Option<String>)> {
+        let (manifest, digest, list_digest) =
+            self._pull_image_manifest_and_list_digest(image).await?;
 
         let mut out: Vec<u8> = Vec::new();
         debug!("Pulling config layer");
         self.pull_blob(image, &manifest.config, &mut out).await?;
         let media_type = manifest.config.media_type.clone();
         let annotations = manifest.annotations.clone();
-        Ok((manifest, digest, Config::new(out, media_type, annotations)))
+        Ok((
+            manifest,
+            digest,
+            Config::new(out, media_type, annotations),
+            list_digest,
+        ))
     }
 
     /// Push a manifest list to an OCI registry.
@@ -958,54 +1239,62 @@ impl Client {
 
     /// Pull a single layer from an OCI registry.
     ///
-    /// This pulls the layer for a particular image that is identified by
-    /// the given layer descriptor. The image reference is used to find the
-    /// repository and the registry, but it is not used to verify that
-    /// the digest is a layer inside of the image. (The manifest is
-    /// used for that.)
-    pub async fn pull_blob<T: AsyncWrite + Unpin>(
+    /// This pulls the layer for a particular image that is identified by the given layer
+    /// descriptor. The layer descriptor can be anything that can be referenced as a layer
+    /// descriptor. The image reference is used to find the repository and the registry, but it is
+    /// not used to verify that the digest is a layer inside of the image. (The manifest is used for
+    /// that.)
+    pub async fn pull_blob<T: AsyncWrite>(
         &self,
         image: &Reference,
-        layer: &OciDescriptor,
-        mut out: T,
+        layer: impl AsLayerDescriptor,
+        out: T,
     ) -> Result<()> {
-        let url = self.to_v2_blob_url(image.resolve_registry(), image.repository(), &layer.digest);
+        let response = self.pull_blob_response(image, &layer, None, None).await?;
 
-        let mut response = RequestBuilderWrapper::from_client(self, |client| client.get(&url))
-            .apply_accept(MIME_TYPES_DISTRIBUTION_MANIFEST)?
-            .apply_auth(image, RegistryOperation::Pull)
-            .await?
-            .into_request_builder()
-            .send()
-            .await?;
+        let mut maybe_header_digester = digest_header_value(response.headers().clone())?
+            .map(|digest| Digester::new(&digest).map(|d| (d, digest)))
+            .transpose()?;
 
-        if let Some(urls) = &layer.urls {
-            for url in urls {
-                if response.error_for_status_ref().is_ok() {
-                    break;
-                }
-
-                let url = Url::parse(url)
-                    .map_err(|e| OciDistributionError::UrlParseError(e.to_string()))?;
-
-                if url.scheme() == "http" || url.scheme() == "https" {
-                    // NOTE: we must not authenticate on additional URLs as those
-                    // can be abused to leak credentials or tokens.  Please
-                    // refer to CVE-2020-15157 for more information.
-                    response =
-                        RequestBuilderWrapper::from_client(self, |client| client.get(url.clone()))
-                            .apply_accept(MIME_TYPES_DISTRIBUTION_MANIFEST)?
-                            .into_request_builder()
-                            .send()
-                            .await?
-                }
-            }
-        }
+        // With a blob pull, we need to use the digest from the layer and not the image
+        let layer_digest = layer.as_layer_descriptor().digest.to_string();
+        let mut layer_digester = Digester::new(&layer_digest)?;
 
         let mut stream = response.error_for_status()?.bytes_stream();
 
+        let mut out = pin!(out);
+
         while let Some(bytes) = stream.next().await {
-            out.write_all(&bytes?).await?;
+            let bytes = bytes?;
+            if let Some((ref mut digester, _)) = maybe_header_digester.as_mut() {
+                digester.update(&bytes);
+            }
+            layer_digester.update(&bytes);
+            out.write_all(&bytes).await?;
+        }
+
+        // Ensure all buffered writes are flushed before returning.
+        out.flush().await?;
+
+        if let Some((mut digester, expected)) = maybe_header_digester.take() {
+            let digest = digester.finalize();
+
+            if digest != expected {
+                return Err(DigestError::VerificationError {
+                    expected,
+                    actual: digest,
+                }
+                .into());
+            }
+        }
+
+        let digest = layer_digester.finalize();
+        if digest != layer_digest {
+            return Err(DigestError::VerificationError {
+                expected: layer_digest,
+                actual: digest,
+            }
+            .into());
         }
 
         Ok(())
@@ -1013,22 +1302,110 @@ impl Client {
 
     /// Stream a single layer from an OCI registry.
     ///
-    /// This is a streaming version of [`Client::pull_blob`].
-    /// Returns [`Stream`](futures_util::Stream).
+    /// This is a streaming version of [`Client::pull_blob`]. Returns [`SizedStream`], which
+    /// implements [`Stream`] or can be used directly to get the content
+    /// length of the response
+    ///
+    /// # Example
+    /// ```rust
+    /// use std::future::Future;
+    /// use std::io::Error;
+    ///
+    /// use futures_util::TryStreamExt;
+    /// use oci_client::{Client, Reference};
+    /// use oci_client::client::ClientConfig;
+    /// use oci_client::manifest::OciDescriptor;
+    ///
+    /// async {
+    ///   let client = Client::new(Default::default());
+    ///   let imgRef: Reference = "busybox:latest".parse().unwrap();
+    ///   let desc = OciDescriptor { digest: "sha256:deadbeef".to_owned(), ..Default::default() };
+    ///   let mut stream = client.pull_blob_stream(&imgRef, &desc).await.unwrap();
+    ///   // Check the optional content length
+    ///   let content_length = stream.content_length.unwrap_or_default();
+    ///   // Use as a stream
+    ///   stream.try_next().await.unwrap().unwrap();
+    ///   // Use the underlying stream
+    ///   let mut stream = stream.stream;
+    /// };
+    /// ```
     pub async fn pull_blob_stream(
         &self,
         image: &Reference,
-        layer: &OciDescriptor,
-    ) -> Result<impl Stream<Item = std::result::Result<bytes::Bytes, std::io::Error>>> {
-        let url = self.to_v2_blob_url(image.resolve_registry(), image.repository(), &layer.digest);
+        layer: impl AsLayerDescriptor,
+    ) -> Result<SizedStream> {
+        stream_from_response(
+            self.pull_blob_response(image, &layer, None, None).await?,
+            layer,
+            true,
+        )
+    }
 
-        let mut response = RequestBuilderWrapper::from_client(self, |client| client.get(&url))
+    /// Stream a single layer from an OCI registry starting with a byte offset. This can be used to
+    /// continue downloading a layer after a network error. Please note that when doing a partial
+    /// download (meaning it returns the [`BlobResponse::Partial`] variant), the layer digest is not
+    /// verified as all the bytes are not available. The returned blob response will contain the
+    /// header from the request digest, if it was set, that can be used (in addition to the digest
+    /// from the layer) to verify the blob once all the bytes have been downloaded. Failure to do
+    /// this means your content will not be verified.
+    ///
+    /// Returns [`BlobResponse`] which indicates if the response was a full or partial response.
+    pub async fn pull_blob_stream_partial(
+        &self,
+        image: &Reference,
+        layer: impl AsLayerDescriptor,
+        offset: u64,
+        length: Option<u64>,
+    ) -> Result<BlobResponse> {
+        let response = self
+            .pull_blob_response(image, &layer, Some(offset), length)
+            .await?;
+
+        let status = response.status();
+        match status {
+            StatusCode::OK => Ok(BlobResponse::Full(stream_from_response(
+                response, &layer, true,
+            )?)),
+            StatusCode::PARTIAL_CONTENT => Ok(BlobResponse::Partial(stream_from_response(
+                response, &layer, false,
+            )?)),
+            _ => Err(OciDistributionError::ServerError {
+                code: status.as_u16(),
+                url: response.url().to_string(),
+                message: response.text().await?,
+            }),
+        }
+    }
+
+    /// Pull a single layer from an OCI registry.
+    async fn pull_blob_response(
+        &self,
+        image: &Reference,
+        layer: impl AsLayerDescriptor,
+        offset: Option<u64>,
+        length: Option<u64>,
+    ) -> Result<Response> {
+        let layer = layer.as_layer_descriptor();
+        let url = self.to_v2_blob_url(image, layer.digest);
+
+        let mut request = RequestBuilderWrapper::from_client(self, |client| client.get(&url))
             .apply_accept(MIME_TYPES_DISTRIBUTION_MANIFEST)?
             .apply_auth(image, RegistryOperation::Pull)
             .await?
-            .into_request_builder()
-            .send()
-            .await?;
+            .into_request_builder();
+        if let (Some(off), Some(len)) = (offset, length) {
+            let end = (off + len).saturating_sub(1);
+            request = request.header(
+                RANGE,
+                HeaderValue::from_str(&format!("bytes={off}-{end}")).unwrap(),
+            );
+        } else if let Some(offset) = offset {
+            request = request.header(
+                RANGE,
+                HeaderValue::from_str(&format!("bytes={offset}-")).unwrap(),
+            );
+        }
+        let mut response = request.send().await?;
 
         if let Some(urls) = &layer.urls {
             for url in urls {
@@ -1043,22 +1420,22 @@ impl Client {
                     // NOTE: we must not authenticate on additional URLs as those
                     // can be abused to leak credentials or tokens.  Please
                     // refer to CVE-2020-15157 for more information.
-                    response =
+                    request =
                         RequestBuilderWrapper::from_client(self, |client| client.get(url.clone()))
                             .apply_accept(MIME_TYPES_DISTRIBUTION_MANIFEST)?
-                            .into_request_builder()
-                            .send()
-                            .await?
+                            .into_request_builder();
+                    if let Some(offset) = offset {
+                        request = request.header(
+                            RANGE,
+                            HeaderValue::from_str(&format!("bytes={offset}-")).unwrap(),
+                        );
+                    }
+                    response = request.send().await?
                 }
             }
         }
 
-        let stream = response
-            .error_for_status()?
-            .bytes_stream()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e));
-
-        Ok(stream)
+        Ok(response)
     }
 
     /// Begins a session to push an image to registry in a monolithical way
@@ -1071,6 +1448,11 @@ impl Client {
             .apply_auth(image, RegistryOperation::Push)
             .await?
             .into_request_builder()
+            // We set "Content-Length" to 0 here even though the OCI Distribution
+            // spec does not strictly require that. In practice we have seen that
+            // certain registries require "Content-Length" to be present for all
+            // types of push sessions.
+            .header("Content-Length", 0)
             .send()
             .await?;
 
@@ -1127,13 +1509,14 @@ impl Client {
         &self,
         location: &str,
         image: &Reference,
-        layer: &[u8],
+        layer: impl Into<bytes::Bytes>,
         blob_digest: &str,
     ) -> Result<String> {
         let mut url = Url::parse(location).unwrap();
         url.query_pairs_mut().append_pair("digest", blob_digest);
         let url = url.to_string();
 
+        let layer = layer.into();
         debug!(size = layer.len(), location = ?url, "Pushing monolithically");
         if layer.is_empty() {
             return Err(OciDistributionError::PushNoDataError);
@@ -1150,7 +1533,7 @@ impl Client {
             .await?
             .into_request_builder()
             .headers(headers)
-            .body(layer.to_vec())
+            .body(layer)
             .send()
             .await?;
 
@@ -1159,39 +1542,39 @@ impl Client {
             .await
     }
 
-    /// Pushes a single chunk of a blob to a registry,
-    /// as part of a chunked blob upload.
+    /// Pushes a single chunk of a blob to a registry, as part of a chunked blob upload.
+    /// The caller is responsible for chunking the blob data into smaller parts, if needed.
     ///
-    /// Returns the URL location for the next chunk
+    /// Returns the URL location for the next chunk, alongside the start of the next range to upload.
     async fn push_chunk(
         &self,
         location: &str,
         image: &Reference,
-        blob_data: &[u8],
-        start_byte: usize,
+        blob_chunk: bytes::Bytes,
+        range_start: usize,
     ) -> Result<(String, usize)> {
-        if blob_data.is_empty() {
+        if blob_chunk.is_empty() {
             return Err(OciDistributionError::PushNoDataError);
         };
-        let end_byte = if (start_byte + self.push_chunk_size) < blob_data.len() {
-            start_byte + self.push_chunk_size - 1
-        } else {
-            blob_data.len() - 1
-        };
-        let body = blob_data[start_byte..end_byte + 1].to_vec();
+
+        let chunk_size = blob_chunk.len();
+        let end_range_inclusive = range_start + chunk_size - 1;
+
         let mut headers = HeaderMap::new();
         headers.insert(
             "Content-Range",
-            format!("{}-{}", start_byte, end_byte).parse().unwrap(),
+            format!("{range_start}-{end_range_inclusive}")
+                .parse()
+                .unwrap(),
         );
-        headers.insert("Content-Length", format!("{}", body.len()).parse().unwrap());
+
+        headers.insert("Content-Length", format!("{chunk_size}").parse().unwrap());
         headers.insert("Content-Type", "application/octet-stream".parse().unwrap());
 
         debug!(
-            ?start_byte,
-            ?end_byte,
-            blob_data_len = blob_data.len(),
-            body_len = body.len(),
+            ?range_start,
+            ?end_range_inclusive,
+            chunk_size,
             ?location,
             ?headers,
             "Pushing chunk"
@@ -1202,7 +1585,7 @@ impl Client {
             .await?
             .into_request_builder()
             .headers(headers)
-            .body(body)
+            .body(blob_chunk)
             .send()
             .await?;
 
@@ -1210,7 +1593,7 @@ impl Client {
         Ok((
             self.extract_location_header(image, res, &reqwest::StatusCode::ACCEPTED)
                 .await?,
-            end_byte + 1,
+            end_range_inclusive + 1,
         ))
     }
 
@@ -1265,7 +1648,7 @@ impl Client {
     pub async fn push_manifest_raw(
         &self,
         image: &Reference,
-        body: Vec<u8>,
+        body: impl Into<bytes::Bytes>,
         content_type: HeaderValue,
     ) -> Result<String> {
         let url = self.to_v2_manifest_url(image);
@@ -1273,6 +1656,8 @@ impl Client {
 
         let mut headers = HeaderMap::new();
         headers.insert("Content-Type", content_type);
+
+        let body = body.into();
 
         // Calculate the digest of the manifest, this is useful
         // if the remote registry is violating the OCI Distribution Specification.
@@ -1305,12 +1690,191 @@ impl Client {
             let url_base = url
                 .strip_suffix(image.tag().unwrap_or("latest"))
                 .expect("The manifest URL always ends with the image tag suffix");
-            let url_by_digest = format!("{}{}", url_base, manifest_hash);
+            let url_by_digest = format!("{url_base}{manifest_hash}");
 
             return Ok(url_by_digest);
         }
 
         ret
+    }
+
+    /// Pulls the referrers for the given image filtering by the optionally provided artifact type.
+    ///
+    /// Implements the [OCI Distribution Spec referrers API][oci-referrers] with an automatic
+    /// fallback to the [referrers tag schema][oci-tag-schema] when the registry returns a
+    /// `404 Not Found` for the native endpoint (as required by the spec).
+    ///
+    /// Many registries (e.g. ghcr.io) do not implement the native
+    /// `/v2/<name>/referrers/<digest>` endpoint and return 404 instead. The OCI spec
+    /// defines a fallback: the referrers index is stored as a regular OCI Image Index
+    /// under a tag derived from the subject digest by replacing `:` with `-`
+    /// (e.g. `sha256:abc…` → tag `sha256-abc…`).
+    ///
+    /// When the fallback is used, `artifact_type` filtering is applied client-side,
+    /// since the tag schema stores a single unfiltered index with no query-parameter
+    /// support.
+    ///
+    /// If both the native API and the tag schema fail, an empty `OciImageIndex` is
+    /// returned, as per the spec recommendation.
+    ///
+    /// [oci-referrers]: https://github.com/opencontainers/distribution-spec/blob/main/spec.md#listing-referrers
+    /// [oci-tag-schema]: https://github.com/opencontainers/distribution-spec/blob/main/spec.md#referrers-tag-schema
+    pub async fn pull_referrers(
+        &self,
+        image: &Reference,
+        artifact_type: Option<&str>,
+    ) -> Result<OciImageIndex> {
+        let url = self.to_v2_referrers_url(image, artifact_type)?;
+        debug!("Pulling referrers from {}", url);
+
+        let res = RequestBuilderWrapper::from_client(self, |client| client.get(&url))
+            .apply_accept(MIME_TYPES_DISTRIBUTION_MANIFEST)?
+            .apply_auth(image, RegistryOperation::Pull)
+            .await?
+            .into_request_builder()
+            .send()
+            .await?;
+        let status = res.status();
+        let body = res.bytes().await?;
+
+        // Per the OCI Distribution Spec, a 404 on the native referrers endpoint means the
+        // registry does not support it; fall back to the referrers tag schema.
+        if status == reqwest::StatusCode::NOT_FOUND {
+            debug!(
+                url = %url,
+                "Native referrers API returned 404; falling back to OCI referrers tag schema"
+            );
+            return self
+                .pull_referrers_via_tag_schema(image, artifact_type)
+                .await;
+        }
+
+        validate_registry_response(status, &body, &url)?;
+        let manifest = serde_json::from_slice(&body)
+            .map_err(|e| OciDistributionError::ManifestParsingError(e.to_string()))?;
+
+        Ok(manifest)
+    }
+
+    /// Pulls the referrers index using the OCI referrers tag schema fallback.
+    ///
+    /// The tag is the subject digest with `:` replaced by `-`
+    /// (e.g. `sha256:abc…` → `sha256-abc…`).
+    ///
+    /// If `artifact_type` is provided, the returned index is filtered client-side
+    /// to include only entries whose `artifact_type` matches.
+    ///
+    /// If the tag does not exist or does not contain a valid image index, an empty
+    /// `OciImageIndex` is returned as per the OCI spec recommendation.
+    async fn pull_referrers_via_tag_schema(
+        &self,
+        image: &Reference,
+        artifact_type: Option<&str>,
+    ) -> Result<OciImageIndex> {
+        let digest = image.digest().ok_or_else(|| {
+            OciDistributionError::GenericError(Some(
+                "Getting referrers for a tag is not supported".into(),
+            ))
+        })?;
+
+        let fallback_tag = digest.replace(':', "-");
+        let fallback_ref = Reference::with_tag(
+            image.resolve_registry().to_string(),
+            image.repository().to_string(),
+            fallback_tag.clone(),
+        );
+
+        debug!(
+            tag = %fallback_tag,
+            "Pulling referrers via tag schema"
+        );
+
+        let manifest = match self._pull_manifest(&fallback_ref).await {
+            Ok((manifest, _digest)) => manifest,
+            Err(e) => match &e {
+                OciDistributionError::ImageManifestNotFoundError(_)
+                | OciDistributionError::RegistryError { .. }
+                | OciDistributionError::ServerError { code: 404, .. } => {
+                    debug!(
+                        error = ?e,
+                        "Referrers tag schema not found; assuming no referrers"
+                    );
+                    return Ok(empty_image_index());
+                }
+                _ => return Err(e),
+            },
+        };
+
+        let mut index = match manifest {
+            OciManifest::ImageIndex(idx) => idx,
+            OciManifest::Image(_) => {
+                return Err(OciDistributionError::SpecViolationError(format!(
+                    "referrers tag schema: tag '{fallback_tag}' contains an Image manifest; \
+                     expected an OCI Image Index"
+                )));
+            }
+        };
+
+        // Apply client-side artifact_type filtering when requested, since the tag
+        // schema stores a single unfiltered index.
+        if let Some(at) = artifact_type {
+            index.manifests.retain(|entry| {
+                entry
+                    .artifact_type
+                    .as_deref()
+                    .map(|t| t == at)
+                    .unwrap_or(false)
+            });
+        }
+
+        Ok(index)
+    }
+
+    /// Lists available repositories in the registry.
+    ///
+    /// Implements the OCI Distribution Spec catalog endpoint (`/v2/_catalog`).
+    /// Supports pagination via `n` (page size) and `last` (last repo from
+    /// previous page).
+    pub async fn catalog(
+        &self,
+        image: &Reference,
+        auth: &RegistryAuth,
+        n: Option<usize>,
+        last: Option<&str>,
+    ) -> Result<CatalogResponse> {
+        let op = RegistryOperation::Pull;
+        let url = self.to_catalog_url(image);
+
+        self.store_auth_if_needed(image.resolve_registry(), auth)
+            .await;
+
+        let request = self.client.get(&url);
+        let request = if let Some(num) = n {
+            request.query(&[("n", num)])
+        } else {
+            request
+        };
+        let request = if let Some(l) = last {
+            request.query(&[("last", l)])
+        } else {
+            request
+        };
+        let request = RequestBuilderWrapper {
+            client: self,
+            request_builder: request,
+        };
+        let res = request
+            .apply_auth(image, op)
+            .await?
+            .into_request_builder()
+            .send()
+            .await?;
+        let status = res.status();
+        let body = res.bytes().await?;
+
+        validate_registry_response(status, &body, &url)?;
+
+        Ok(serde_json::from_str(std::str::from_utf8(&body)?)?)
     }
 
     async fn extract_location_header(
@@ -1353,12 +1917,11 @@ impl Client {
         location_header: &reqwest::header::HeaderValue,
     ) -> Result<String> {
         let lh = location_header.to_str()?;
-        if lh.starts_with("/v2/") {
+        if lh.starts_with("/") {
+            let registry = image.resolve_registry();
             Ok(format!(
-                "{}://{}{}",
-                self.config.protocol.scheme_for(image.resolve_registry()),
-                image.resolve_registry(),
-                lh
+                "{scheme}://{registry}{lh}",
+                scheme = self.config.protocol.scheme_for(registry)
             ))
         } else {
             Ok(lh.to_string())
@@ -1367,58 +1930,96 @@ impl Client {
 
     /// Convert a Reference to a v2 manifest URL.
     fn to_v2_manifest_url(&self, reference: &Reference) -> String {
-        if let Some(digest) = reference.digest() {
-            format!(
-                "{}://{}/v2/{}/manifests/{}",
-                self.config
-                    .protocol
-                    .scheme_for(reference.resolve_registry()),
-                reference.resolve_registry(),
-                reference.repository(),
-                digest,
-            )
-        } else {
-            format!(
-                "{}://{}/v2/{}/manifests/{}",
-                self.config
-                    .protocol
-                    .scheme_for(reference.resolve_registry()),
-                reference.resolve_registry(),
-                reference.repository(),
+        let registry = reference.resolve_registry();
+        format!(
+            "{scheme}://{registry}/v2/{repository}/manifests/{reference}{ns}",
+            scheme = self.config.protocol.scheme_for(registry),
+            repository = reference.repository(),
+            reference = if let Some(digest) = reference.digest() {
+                digest
+            } else {
                 reference.tag().unwrap_or("latest")
-            )
-        }
+            },
+            ns = reference
+                .namespace()
+                .map(|ns| format!("?ns={ns}"))
+                .unwrap_or_default(),
+        )
     }
 
     /// Convert a Reference to a v2 blob (layer) URL.
-    fn to_v2_blob_url(&self, registry: &str, repository: &str, digest: &str) -> String {
+    fn to_v2_blob_url(&self, reference: &Reference, digest: &str) -> String {
+        let registry = reference.resolve_registry();
         format!(
-            "{}://{}/v2/{}/blobs/{}",
-            self.config.protocol.scheme_for(registry),
-            registry,
-            repository,
-            digest,
+            "{scheme}://{registry}/v2/{repository}/blobs/{digest}{ns}",
+            scheme = self.config.protocol.scheme_for(registry),
+            repository = reference.repository(),
+            ns = reference
+                .namespace()
+                .map(|ns| format!("?ns={ns}"))
+                .unwrap_or_default(),
         )
     }
 
     /// Convert a Reference to a v2 blob upload URL.
     fn to_v2_blob_upload_url(&self, reference: &Reference) -> String {
-        self.to_v2_blob_url(
-            reference.resolve_registry(),
-            reference.repository(),
-            "uploads/",
-        )
+        self.to_v2_blob_url(reference, "uploads/")
     }
 
     fn to_list_tags_url(&self, reference: &Reference) -> String {
+        let registry = reference.resolve_registry();
         format!(
-            "{}://{}/v2/{}/tags/list",
-            self.config
-                .protocol
-                .scheme_for(reference.resolve_registry()),
-            reference.resolve_registry(),
-            reference.repository(),
+            "{scheme}://{registry}/v2/{repository}/tags/list{ns}",
+            scheme = self.config.protocol.scheme_for(registry),
+            repository = reference.repository(),
+            ns = reference
+                .namespace()
+                .map(|ns| format!("?ns={ns}"))
+                .unwrap_or_default(),
         )
+    }
+
+    fn to_catalog_url(&self, reference: &Reference) -> String {
+        let registry = reference.resolve_registry();
+        format!(
+            "{scheme}://{registry}/v2/_catalog",
+            scheme = self.config.protocol.scheme_for(registry),
+        )
+    }
+
+    /// Convert a Reference to a v2 referrers URL.
+    fn to_v2_referrers_url(
+        &self,
+        reference: &Reference,
+        artifact_type: Option<&str>,
+    ) -> Result<String> {
+        let digest = reference.digest().ok_or_else(|| {
+            OciDistributionError::GenericError(Some(
+                "Getting referrers for a tag is not supported".into(),
+            ))
+        })?;
+
+        let registry = reference.resolve_registry();
+        let base = format!(
+            "{scheme}://{registry}",
+            scheme = self.config.protocol.scheme_for(registry),
+        );
+        let mut url =
+            Url::parse(&base).map_err(|e| OciDistributionError::UrlParseError(e.to_string()))?;
+        url.path_segments_mut()
+            .map_err(|_| {
+                OciDistributionError::GenericError(Some(
+                    "cannot build referrers URL: base URL is cannot-be-a-base".into(),
+                ))
+            })?
+            .push("v2")
+            .extend(reference.repository().split('/'))
+            .push("referrers")
+            .push(digest);
+        if let Some(at) = artifact_type {
+            url.query_pairs_mut().append_pair("artifactType", at);
+        }
+        Ok(url.into())
     }
 }
 
@@ -1437,13 +2038,19 @@ fn validate_registry_response(status: reqwest::StatusCode, body: &[u8], url: &st
             status,
         ))),
         s if s.is_client_error() => {
-            let text = std::str::from_utf8(body)?;
-            // According to the OCI spec, we should see an error in the message body.
-            let envelope = serde_json::from_str::<OciEnvelope>(text)?;
-            Err(OciDistributionError::RegistryError {
-                envelope,
-                url: url.to_string(),
-            })
+            match serde_json::from_slice::<OciEnvelope>(body) {
+                // According to the OCI spec, we should see an error in the message body.
+                Ok(envelope) => Err(OciDistributionError::RegistryError {
+                    envelope,
+                    url: url.to_string(),
+                }),
+                // Fall back to a plain server error if the body isn't a valid `OciEnvelope`
+                Err(_) => Err(OciDistributionError::ServerError {
+                    code: s.as_u16(),
+                    url: url.to_string(),
+                    message: String::from_utf8_lossy(body).to_string(),
+                }),
+            }
         }
         s => {
             let text = std::str::from_utf8(body)?;
@@ -1455,6 +2062,58 @@ fn validate_registry_response(status: reqwest::StatusCode, body: &[u8], url: &st
             })
         }
     }
+}
+
+/// Returns an empty OCI Image Index, as used when no referrers exist.
+fn empty_image_index() -> OciImageIndex {
+    OciImageIndex {
+        schema_version: 2,
+        media_type: Some(crate::manifest::OCI_IMAGE_INDEX_MEDIA_TYPE.to_string()),
+        artifact_type: None,
+        annotations: None,
+        manifests: vec![],
+    }
+}
+
+/// Converts a response into a stream
+fn stream_from_response(
+    response: Response,
+    layer: impl AsLayerDescriptor,
+    verify: bool,
+) -> Result<SizedStream> {
+    let content_length = response.content_length();
+    let headers = response.headers().clone();
+    let stream = response
+        .error_for_status()?
+        .bytes_stream()
+        .map_err(std::io::Error::other);
+
+    let expected_layer_digest = layer.as_layer_descriptor().digest.to_string();
+    let layer_digester = Digester::new(&expected_layer_digest)?;
+    let header_digester_and_digest = match digest_header_value(headers)? {
+        // If the digests match, we don't need to do both digesters
+        Some(digest) if digest == expected_layer_digest => None,
+        Some(digest) => Some((Digester::new(&digest)?, digest)),
+        None => None,
+    };
+    let header_digest = header_digester_and_digest
+        .as_ref()
+        .map(|(_, digest)| digest.to_owned());
+    let stream: BoxStream<'static, std::result::Result<bytes::Bytes, std::io::Error>> = if verify {
+        Box::pin(VerifyingStream::new(
+            Box::pin(stream),
+            layer_digester,
+            expected_layer_digest,
+            header_digester_and_digest,
+        ))
+    } else {
+        Box::pin(stream)
+    };
+    Ok(SizedStream {
+        content_length,
+        digest_header_value: header_digest,
+        stream,
+    })
 }
 
 /// The request builder wrapper allows to be instantiated from a
@@ -1473,7 +2132,7 @@ impl<'a> RequestBuilderWrapper<'a> {
     fn from_client(
         client: &'a Client,
         f: impl Fn(&reqwest::Client) -> RequestBuilder,
-    ) -> RequestBuilderWrapper {
+    ) -> RequestBuilderWrapper<'a> {
         let request_builder = f(&client.client);
         RequestBuilderWrapper {
             client,
@@ -1489,7 +2148,7 @@ impl<'a> RequestBuilderWrapper<'a> {
 
 // Composable functions applicable to a `RequestBuilderWrapper`
 impl<'a> RequestBuilderWrapper<'a> {
-    fn apply_accept(&self, accept: &[&str]) -> Result<RequestBuilderWrapper> {
+    fn apply_accept(&self, accept: &[&str]) -> Result<RequestBuilderWrapper<'_>> {
         let request_builder = self
             .request_builder
             .try_clone()
@@ -1516,7 +2175,7 @@ impl<'a> RequestBuilderWrapper<'a> {
         &self,
         image: &Reference,
         op: RegistryOperation,
-    ) -> Result<RequestBuilderWrapper> {
+    ) -> Result<RequestBuilderWrapper<'_>> {
         let mut headers = HeaderMap::new();
 
         if let Some(token) = self.client.get_auth_token(image, op).await {
@@ -1577,6 +2236,21 @@ pub struct Certificate {
     pub data: Vec<u8>,
 }
 
+impl TryFrom<&Certificate> for reqwest::Certificate {
+    type Error = OciDistributionError;
+
+    fn try_from(cert: &Certificate) -> Result<Self> {
+        match cert.encoding {
+            CertificateEncoding::Der => Ok(reqwest::Certificate::from_der(cert.data.as_slice())?),
+            CertificateEncoding::Pem => Ok(reqwest::Certificate::from_pem(cert.data.as_slice())?),
+        }
+    }
+}
+
+fn convert_certificates(certs: &[Certificate]) -> Result<Vec<reqwest::Certificate>> {
+    certs.iter().map(reqwest::Certificate::try_from).collect()
+}
+
 /// A client configuration
 pub struct ClientConfig {
     /// Which protocol the client should use
@@ -1589,13 +2263,22 @@ pub struct ClientConfig {
     /// Accept invalid certificates. Defaults to false
     pub accept_invalid_certificates: bool,
 
+    /// Use monolithic push for pushing blobs. Defaults to false
+    pub use_monolithic_push: bool,
+
+    /// Use only the provided certificate roots.
+    ///
+    /// This option disables any native or built-in roots, and **only** uses
+    /// the roots provided to this method.
+    pub tls_certs_only: Vec<Certificate>,
+
     /// A list of extra root certificate to trust. This can be used to connect
     /// to servers using self-signed certificates
     pub extra_root_certificates: Vec<Certificate>,
 
     /// A function that defines the client's behaviour if an Image Index Manifest
     /// (i.e Manifest List) is encountered when pulling an image.
-    /// Defaults to [current_platform_resolver](self::current_platform_resolver),
+    /// Defaults to [current_platform_resolver],
     /// which attempts to choose an image matching the running OS and Arch.
     ///
     /// If set to None, an error is raised if an Image Index manifest is received
@@ -1619,6 +2302,36 @@ pub struct ClientConfig {
     ///
     /// This defaults to [`DEFAULT_TOKEN_EXPIRATION_SECS`].
     pub default_token_expiration_secs: usize,
+
+    /// Enables a read timeout for the client.
+    ///
+    /// See [`reqwest::ClientBuilder::read_timeout`] for more information.
+    pub read_timeout: Option<Duration>,
+
+    /// Set a timeout for the connect phase for the client.
+    ///
+    /// See [`reqwest::ClientBuilder::connect_timeout`] for more information.
+    pub connect_timeout: Option<Duration>,
+
+    /// Set the `User-Agent` used by the client.
+    ///
+    /// This defaults to `oci-client/<version>` where `<version>` is the crate version.
+    pub user_agent: &'static str,
+
+    /// Set the `HTTPS PROXY` used by the client.
+    ///
+    /// This defaults to `None`.
+    pub https_proxy: Option<String>,
+
+    /// Set the `HTTP PROXY` used by the client.
+    ///
+    /// This defaults to `None`.
+    pub http_proxy: Option<String>,
+
+    /// Set the `NO PROXY` used by the client.
+    ///
+    /// This defaults to `None`.
+    pub no_proxy: Option<String>,
 }
 
 impl Default for ClientConfig {
@@ -1628,11 +2341,19 @@ impl Default for ClientConfig {
             #[cfg(feature = "native-tls")]
             accept_invalid_hostnames: false,
             accept_invalid_certificates: false,
+            use_monolithic_push: false,
+            tls_certs_only: Vec::new(),
             extra_root_certificates: Vec::new(),
             platform_resolver: Some(Box::new(current_platform_resolver)),
             max_concurrent_upload: DEFAULT_MAX_CONCURRENT_UPLOAD,
             max_concurrent_download: DEFAULT_MAX_CONCURRENT_DOWNLOAD,
             default_token_expiration_secs: DEFAULT_TOKEN_EXPIRATION_SECS,
+            read_timeout: None,
+            connect_timeout: None,
+            user_agent: DEFAULT_USER_AGENT,
+            https_proxy: None,
+            http_proxy: None,
+            no_proxy: None,
         }
     }
 }
@@ -1647,8 +2368,8 @@ pub fn linux_amd64_resolver(manifests: &[ImageIndexEntry]) -> Option<String> {
     manifests
         .iter()
         .find(|entry| {
-            entry.platform.as_ref().map_or(false, |platform| {
-                platform.os == "linux" && platform.architecture == "amd64"
+            entry.platform.as_ref().is_some_and(|platform| {
+                platform.os == Os::Linux && platform.architecture == Arch::Amd64
             })
         })
         .map(|entry| entry.digest.clone())
@@ -1659,46 +2380,11 @@ pub fn windows_amd64_resolver(manifests: &[ImageIndexEntry]) -> Option<String> {
     manifests
         .iter()
         .find(|entry| {
-            entry.platform.as_ref().map_or(false, |platform| {
-                platform.os == "windows" && platform.architecture == "amd64"
+            entry.platform.as_ref().is_some_and(|platform| {
+                platform.os == Os::Windows && platform.architecture == Arch::Amd64
             })
         })
         .map(|entry| entry.digest.clone())
-}
-
-const MACOS: &str = "macos";
-const DARWIN: &str = "darwin";
-
-fn go_os() -> &'static str {
-    // Massage Rust OS var to GO OS:
-    // - Rust: https://doc.rust-lang.org/std/env/consts/constant.OS.html
-    // - Go: https://golang.org/doc/install/source#environment
-    match std::env::consts::OS {
-        MACOS => DARWIN,
-        other => other,
-    }
-}
-
-const X86_64: &str = "x86_64";
-const AMD64: &str = "amd64";
-const X86: &str = "x86";
-const AMD: &str = "amd";
-const ARM64: &str = "arm64";
-const AARCH64: &str = "aarch64";
-const POWERPC64: &str = "powerpc64";
-const PPC64LE: &str = "ppc64le";
-
-fn go_arch() -> &'static str {
-    // Massage Rust Architecture vars to GO equivalent:
-    // - Rust: https://doc.rust-lang.org/std/env/consts/constant.ARCH.html
-    // - Go: https://golang.org/doc/install/source#environment
-    match std::env::consts::ARCH {
-        X86_64 => AMD64,
-        X86 => AMD,
-        AARCH64 => ARM64,
-        POWERPC64 => PPC64LE,
-        other => other,
-    }
 }
 
 /// A platform resolver that chooses the first variant matching the running OS/Arch, if present.
@@ -1707,8 +2393,8 @@ pub fn current_platform_resolver(manifests: &[ImageIndexEntry]) -> Option<String
     manifests
         .iter()
         .find(|entry| {
-            entry.platform.as_ref().map_or(false, |platform| {
-                platform.os == go_os() && platform.architecture == go_arch()
+            entry.platform.as_ref().is_some_and(|platform| {
+                platform.os == Os::default() && platform.architecture == Arch::default()
             })
         })
         .map(|entry| entry.digest.clone())
@@ -1755,7 +2441,7 @@ impl TryFrom<&HeaderValue> for BearerChallenge {
         let parser = ChallengeParser::new(
             value
                 .to_str()
-                .map_err(|e| format!("cannot convert header value to string: {:?}", e))?,
+                .map_err(|e| format!("cannot convert header value to string: {e:?}"))?,
         );
         parser
             .filter_map(|parser_res| {
@@ -1802,45 +2488,29 @@ impl TryFrom<&ChallengeRef<'_>> for BearerChallenge {
     }
 }
 
-/// Extract `Docker-Content-Digest` header from manifest GET or HEAD request.
-/// Can optionally supply a response body (i.e. the manifest itself) to
-/// fallback to manually hashing this content. This should only be done if the
-/// response body contains the image manifest.
-fn digest_header_value(headers: HeaderMap, body: Option<&[u8]>) -> Result<String> {
-    let digest_header = headers.get("Docker-Content-Digest");
-    match digest_header {
-        None => {
-            if let Some(body) = body {
-                // Fallback to hashing payload (tested with ECR)
-                let digest = sha2::Sha256::digest(body);
-                let hex = format!("sha256:{:x}", digest);
-                debug!(%hex, "Computed digest of manifest payload.");
-                Ok(hex)
-            } else {
-                Err(OciDistributionError::RegistryNoDigestError)
-            }
-        }
-        Some(hv) => hv
-            .to_str()
-            .map(|s| s.to_string())
-            .map_err(|e| OciDistributionError::GenericError(Some(e.to_string()))),
-    }
-}
-
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::manifest::{self, IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE};
     use std::convert::TryFrom;
     use std::fs;
     use std::path;
     use std::result::Result;
+
+    use bytes::Bytes;
+    use rstest::rstest;
+    use sha2::Digest as _;
     use tempfile::TempDir;
     use tokio::io::AsyncReadExt;
     use tokio_util::io::StreamReader;
 
+    use crate::manifest::{self, IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE};
+
     #[cfg(feature = "test-registry")]
-    use testcontainers::{clients, core::WaitFor, GenericImage};
+    use testcontainers::{
+        core::{Mount, WaitFor},
+        runners::AsyncRunner,
+        ContainerRequest, GenericImage, ImageExt,
+    };
 
     const HELLO_IMAGE_NO_TAG: &str = "webassembly.azurecr.io/hello-wasm";
     const HELLO_IMAGE_TAG: &str = "webassembly.azurecr.io/hello-wasm:v1";
@@ -1860,6 +2530,10 @@ mod test {
     const HTPASSWD: &str = "testuser:$2y$05$8/q2bfRcX74EuxGf0qOcSuhWDQJXrgWiy6Fi73/JM2tKC66qSrLve";
     const HTPASSWD_USERNAME: &str = "testuser";
     const HTPASSWD_PASSWORD: &str = "testpassword";
+
+    const EMPTY_JSON_BLOB: &str = "{}";
+    const EMPTY_JSON_DIGEST: &str =
+        "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a";
 
     #[test]
     fn test_apply_accept() -> anyhow::Result<()> {
@@ -1905,29 +2579,23 @@ mod test {
         Ok(())
     }
 
+    #[derive(Serialize)]
+    struct EmptyClaims {}
+
     #[tokio::test]
     async fn test_apply_auth_bearer_token() -> anyhow::Result<()> {
-        use hmac::{Hmac, Mac};
-        use jwt::SignWithKey;
-        use sha2::Sha256;
+        crate::test_helpers::jsonwebtoken_install_default_crypto_provider();
+        let _ = tracing_subscriber::fmt::try_init();
         let client = Client::default();
-        let header = jwt::header::Header {
-            algorithm: jwt::algorithm::AlgorithmType::Hs256,
-            key_id: None,
-            type_: None,
-            content_type: None,
-        };
-        let claims: jwt::claims::Claims = Default::default();
-        let key: Hmac<Sha256> = Hmac::new_from_slice(b"some-secret").unwrap();
-        let token = jwt::Token::new(header, claims)
-            .sign_with_key(&key)?
-            .as_str()
-            .to_string();
+        let header = jsonwebtoken::Header::default();
+        let claims = EmptyClaims {};
+        let key = jsonwebtoken::EncodingKey::from_secret(b"some-secret");
+        let token = jsonwebtoken::encode(&header, &claims, &key)?;
 
         // we have to have it in the stored auth so we'll get to the token cache check.
         client
             .store_auth(
-                &Reference::try_from(HELLO_IMAGE_TAG)?.resolve_registry(),
+                Reference::try_from(HELLO_IMAGE_TAG)?.resolve_registry(),
                 RegistryAuth::Anonymous,
             )
             .await;
@@ -1942,6 +2610,7 @@ mod test {
                 }),
             )
             .await;
+
         assert_eq!(
             RequestBuilderWrapper::from_client(&client, |client| client
                 .get("https://example.com/some/module.wasm"))
@@ -1961,31 +2630,34 @@ mod test {
 
     #[test]
     fn test_to_v2_blob_url() {
-        let image = Reference::try_from(HELLO_IMAGE_TAG).expect("failed to parse reference");
-        let blob_url = Client::default().to_v2_blob_url(
-            image.registry(),
-            image.repository(),
-            "sha256:deadbeef",
-        );
-        assert_eq!(
-            blob_url,
-            "https://webassembly.azurecr.io/v2/hello-wasm/blobs/sha256:deadbeef"
-        )
-    }
-
-    #[test]
-    fn test_to_v2_manifest() {
+        let mut image = Reference::try_from(HELLO_IMAGE_TAG).expect("failed to parse reference");
         let c = Client::default();
 
-        for &(image, expected_uri) in [
-            (HELLO_IMAGE_NO_TAG, "https://webassembly.azurecr.io/v2/hello-wasm/manifests/latest"), // TODO: confirm this is the right translation when no tag
-            (HELLO_IMAGE_TAG, "https://webassembly.azurecr.io/v2/hello-wasm/manifests/v1"),
-            (HELLO_IMAGE_DIGEST, "https://webassembly.azurecr.io/v2/hello-wasm/manifests/sha256:51d9b231d5129e3ffc267c9d455c49d789bf3167b611a07ab6e4b3304c96b0e7"),
-            (HELLO_IMAGE_TAG_AND_DIGEST, "https://webassembly.azurecr.io/v2/hello-wasm/manifests/sha256:51d9b231d5129e3ffc267c9d455c49d789bf3167b611a07ab6e4b3304c96b0e7"),
-            ].iter() {
-                let reference = Reference::try_from(image).expect("failed to parse reference");
-                assert_eq!(c.to_v2_manifest_url(&reference), expected_uri);
-            }
+        assert_eq!(
+            c.to_v2_blob_url(&image, "sha256:deadbeef"),
+            "https://webassembly.azurecr.io/v2/hello-wasm/blobs/sha256:deadbeef"
+        );
+
+        image.set_mirror_registry("docker.mirror.io".to_owned());
+        assert_eq!(
+            c.to_v2_blob_url(&image, "sha256:deadbeef"),
+            "https://docker.mirror.io/v2/hello-wasm/blobs/sha256:deadbeef?ns=webassembly.azurecr.io"
+        );
+    }
+
+    #[rstest(image, expected_uri, expected_mirror_uri,
+        case(HELLO_IMAGE_NO_TAG, "https://webassembly.azurecr.io/v2/hello-wasm/manifests/latest", "https://docker.mirror.io/v2/hello-wasm/manifests/latest?ns=webassembly.azurecr.io"), // TODO: confirm this is the right translation when no tag
+        case(HELLO_IMAGE_TAG, "https://webassembly.azurecr.io/v2/hello-wasm/manifests/v1", "https://docker.mirror.io/v2/hello-wasm/manifests/v1?ns=webassembly.azurecr.io"),
+        case(HELLO_IMAGE_DIGEST, "https://webassembly.azurecr.io/v2/hello-wasm/manifests/sha256:51d9b231d5129e3ffc267c9d455c49d789bf3167b611a07ab6e4b3304c96b0e7", "https://docker.mirror.io/v2/hello-wasm/manifests/sha256:51d9b231d5129e3ffc267c9d455c49d789bf3167b611a07ab6e4b3304c96b0e7?ns=webassembly.azurecr.io"),
+        case(HELLO_IMAGE_TAG_AND_DIGEST, "https://webassembly.azurecr.io/v2/hello-wasm/manifests/sha256:51d9b231d5129e3ffc267c9d455c49d789bf3167b611a07ab6e4b3304c96b0e7", "https://docker.mirror.io/v2/hello-wasm/manifests/sha256:51d9b231d5129e3ffc267c9d455c49d789bf3167b611a07ab6e4b3304c96b0e7?ns=webassembly.azurecr.io"),
+    )]
+    fn test_to_v2_manifest(image: &str, expected_uri: &str, expected_mirror_uri: &str) {
+        let mut reference = Reference::try_from(image).expect("failed to parse reference");
+        let c = Client::default();
+        assert_eq!(c.to_v2_manifest_url(&reference), expected_uri);
+
+        reference.set_mirror_registry("docker.mirror.io".to_owned());
+        assert_eq!(c.to_v2_manifest_url(&reference), expected_mirror_uri);
     }
 
     #[test]
@@ -2001,13 +2673,56 @@ mod test {
 
     #[test]
     fn test_to_list_tags_url() {
-        let image = Reference::try_from(HELLO_IMAGE_TAG).expect("failed to parse reference");
-        let blob_url = Client::default().to_list_tags_url(&image);
+        let mut image = Reference::try_from(HELLO_IMAGE_TAG).expect("failed to parse reference");
+        let c = Client::default();
 
         assert_eq!(
-            blob_url,
+            c.to_list_tags_url(&image),
             "https://webassembly.azurecr.io/v2/hello-wasm/tags/list"
-        )
+        );
+
+        image.set_mirror_registry("docker.mirror.io".to_owned());
+        assert_eq!(
+            c.to_list_tags_url(&image),
+            "https://docker.mirror.io/v2/hello-wasm/tags/list?ns=webassembly.azurecr.io"
+        );
+    }
+
+    #[test]
+    fn test_to_catalog_url() {
+        let mut image = Reference::try_from(HELLO_IMAGE_TAG).expect("failed to parse reference");
+        let c = Client::default();
+
+        assert_eq!(
+            c.to_catalog_url(&image),
+            "https://webassembly.azurecr.io/v2/_catalog"
+        );
+
+        image.set_mirror_registry("docker.mirror.io".to_owned());
+        assert_eq!(
+            c.to_catalog_url(&image),
+            "https://docker.mirror.io/v2/_catalog"
+        );
+    }
+
+    #[test]
+    fn test_to_v2_referrers_url() {
+        let image = Reference::try_from(HELLO_IMAGE_DIGEST).expect("failed to parse reference");
+        let c = Client::default();
+
+        // No filter: no query string.
+        assert_eq!(
+            c.to_v2_referrers_url(&image, None).unwrap(),
+            "https://webassembly.azurecr.io/v2/hello-wasm/referrers/sha256:51d9b231d5129e3ffc267c9d455c49d789bf3167b611a07ab6e4b3304c96b0e7"
+        );
+
+        // With filter: the artifactType value is percent-encoded. The `+` in `+json`
+        // media types must become `%2B`, otherwise standard query-string decoding turns
+        // it into a space and the registry filter matches nothing.
+        assert_eq!(
+            c.to_v2_referrers_url(&image, Some("application/spdx+json")).unwrap(),
+            "https://webassembly.azurecr.io/v2/hello-wasm/referrers/sha256:51d9b231d5129e3ffc267c9d455c49d789bf3167b611a07ab6e4b3304c96b0e7?artifactType=application%2Fspdx%2Bjson"
+        );
     }
 
     #[test]
@@ -2034,11 +2749,7 @@ mod test {
             .expect("Could not parse reference");
         assert_eq!(
             "http://webassembly.azurecr.io/v2/hello/blobs/sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
-            c.to_v2_blob_url(
-                reference.registry(),
-                reference.repository(),
-                reference.digest().unwrap()
-            )
+            c.to_v2_blob_url(&reference, reference.digest().unwrap())
         );
     }
 
@@ -2086,11 +2797,7 @@ mod test {
             .expect("Could not parse reference");
         assert_eq!(
             "https://webassembly.azurecr.io/v2/hello/blobs/sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
-            c.to_v2_blob_url(
-                reference.registry(),
-                reference.repository(),
-                reference.digest().unwrap()
-            )
+            c.to_v2_blob_url(&reference, reference.digest().unwrap())
         );
     }
 
@@ -2106,11 +2813,7 @@ mod test {
             .expect("Could not parse reference");
         assert_eq!(
             "http://oci.registry.local/v2/hello/blobs/sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
-            c.to_v2_blob_url(
-                reference.registry(),
-                reference.repository(),
-                reference.digest().unwrap()
-            )
+            c.to_v2_blob_url(&reference, reference.digest().unwrap())
         );
     }
 
@@ -2228,6 +2931,7 @@ mod test {
 
     #[tokio::test]
     async fn test_auth() {
+        let _ = tracing_subscriber::fmt::try_init();
         for &image in TEST_IMAGES {
             let reference = Reference::try_from(image).expect("failed to parse reference");
             let c = Client::default();
@@ -2260,9 +2964,14 @@ mod test {
     #[cfg(feature = "test-registry")]
     #[tokio::test]
     async fn test_list_tags() {
-        let docker = clients::Cli::default();
-        let test_container = docker.run(registry_image_edge());
-        let port = test_container.get_host_port_ipv4(5000);
+        let test_container = registry_image_edge()
+            .start()
+            .await
+            .expect("Failed to start registry container");
+        let port = test_container
+            .get_host_port_ipv4(5000)
+            .await
+            .expect("Failed to get port");
         let auth =
             RegistryAuth::Basic(HTPASSWD_USERNAME.to_string(), HTPASSWD_PASSWORD.to_string());
 
@@ -2288,7 +2997,7 @@ mod test {
             .expect("failed to pull image");
 
         for i in 0..=3 {
-            let push_image: Reference = format!("localhost:{}/hello-wasm:1.0.{}", port, i)
+            let push_image: Reference = format!("localhost:{port}/hello-wasm:1.0.{i}")
                 .parse()
                 .unwrap();
             client
@@ -2307,7 +3016,7 @@ mod test {
                 .expect("Failed to push Image");
         }
 
-        let image: Reference = format!("localhost:{}/hello-wasm:1.0.1", port)
+        let image: Reference = format!("localhost:{port}/hello-wasm:1.0.1")
             .parse()
             .unwrap();
         let response = client
@@ -2315,6 +3024,95 @@ mod test {
             .await
             .expect("Cannot list Tags");
         assert_eq!(response.tags, vec!["1.0.2", "1.0.3"])
+    }
+
+    #[cfg(feature = "test-registry")]
+    #[tokio::test]
+    async fn test_catalog() {
+        let test_container = registry_image_edge()
+            .start()
+            .await
+            .expect("Failed to start registry container");
+        let port = test_container
+            .get_host_port_ipv4(5000)
+            .await
+            .expect("Failed to get port");
+        let auth =
+            RegistryAuth::Basic(HTPASSWD_USERNAME.to_string(), HTPASSWD_PASSWORD.to_string());
+
+        let client = Client::new(ClientConfig {
+            protocol: ClientProtocol::HttpsExcept(vec![format!("localhost:{}", port)]),
+            ..Default::default()
+        });
+
+        let image: Reference = HELLO_IMAGE_TAG_AND_DIGEST.parse().unwrap();
+        client
+            .auth(&image, &RegistryAuth::Anonymous, RegistryOperation::Pull)
+            .await
+            .expect("cannot authenticate against registry for pull operation");
+
+        let (manifest, _digest) = client
+            ._pull_image_manifest(&image)
+            .await
+            .expect("failed to pull manifest");
+
+        let image_data = client
+            .pull(&image, &auth, vec![manifest::WASM_LAYER_MEDIA_TYPE])
+            .await
+            .expect("failed to pull image");
+
+        // Push to two different repositories
+        for repo in &["hello-catalog-a", "hello-catalog-b"] {
+            let push_image: Reference = format!("localhost:{port}/{repo}:latest").parse().unwrap();
+            client
+                .auth(&push_image, &auth, RegistryOperation::Push)
+                .await
+                .expect("authenticated");
+            client
+                .push(
+                    &push_image,
+                    &image_data.layers,
+                    image_data.config.clone(),
+                    &auth,
+                    Some(manifest.clone()),
+                )
+                .await
+                .expect("Failed to push Image");
+        }
+
+        // Use any valid reference for the same registry to call catalog
+        let catalog_ref: Reference = format!("localhost:{port}/hello-catalog-a:latest")
+            .parse()
+            .unwrap();
+        let response = client
+            .catalog(&catalog_ref, &RegistryAuth::Anonymous, None, None)
+            .await
+            .expect("Cannot list catalog");
+        assert!(response
+            .repositories
+            .contains(&"hello-catalog-a".to_string()));
+        assert!(response
+            .repositories
+            .contains(&"hello-catalog-b".to_string()));
+
+        // Test pagination: request 1 result at a time
+        let page1 = client
+            .catalog(&catalog_ref, &RegistryAuth::Anonymous, Some(1), None)
+            .await
+            .expect("Cannot list catalog page 1");
+        assert_eq!(page1.repositories.len(), 1);
+
+        let page2 = client
+            .catalog(
+                &catalog_ref,
+                &RegistryAuth::Anonymous,
+                Some(1),
+                Some(&page1.repositories[0]),
+            )
+            .await
+            .expect("Cannot list catalog page 2");
+        assert_eq!(page2.repositories.len(), 1);
+        assert_ne!(page1.repositories[0], page2.repositories[0]);
     }
 
     #[tokio::test]
@@ -2437,11 +3235,8 @@ mod test {
             // This call likes to flake, so we try it at least 5 times
             let mut last_error = None;
             for i in 1..6 {
-                if let Err(e) = c.pull_blob(&reference, &layer0, &mut file).await {
-                    println!(
-                        "Got error on pull_blob call attempt {}. Will retry in 1s: {:?}",
-                        i, e
-                    );
+                if let Err(e) = c.pull_blob(&reference, layer0, &mut file).await {
+                    println!("Got error on pull_blob call attempt {i}. Will retry in 1s: {e:?}");
                     last_error.replace(e);
                     tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
                 } else {
@@ -2451,7 +3246,7 @@ mod test {
             }
 
             if let Some(e) = last_error {
-                panic!("Unable to pull layer: {:?}", e);
+                panic!("Unable to pull layer: {e:?}");
             }
 
             // The manifest says how many bytes we should expect.
@@ -2482,16 +3277,85 @@ mod test {
             let layer0 = &manifest.layers[0];
 
             let layer_stream = c
-                .pull_blob_stream(&reference, &layer0)
+                .pull_blob_stream(&reference, layer0)
                 .await
                 .expect("failed to pull blob stream");
 
-            AsyncReadExt::read_to_end(&mut StreamReader::new(layer_stream), &mut file)
+            assert_eq!(layer_stream.content_length, Some(layer0.size as u64));
+            AsyncReadExt::read_to_end(&mut StreamReader::new(layer_stream.stream), &mut file)
                 .await
                 .unwrap();
 
             // The manifest says how many bytes we should expect.
             assert_eq!(file.len(), layer0.size as usize);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pull_blob_stream_partial() {
+        let c = Client::default();
+
+        for &image in TEST_IMAGES {
+            let reference = Reference::try_from(image).expect("failed to parse reference");
+            c.auth(
+                &reference,
+                &RegistryAuth::Anonymous,
+                RegistryOperation::Pull,
+            )
+            .await
+            .expect("authenticated");
+            let (manifest, _) = c
+                ._pull_image_manifest(&reference)
+                .await
+                .expect("failed to pull manifest");
+
+            // Pull part of one specific layer
+            let mut partial_file: Vec<u8> = Vec::new();
+            let layer0 = &manifest.layers[0];
+            let (offset, length) = (10, 6);
+
+            let partial_response = c
+                .pull_blob_stream_partial(&reference, layer0, offset, Some(length))
+                .await
+                .expect("failed to pull blob stream");
+            let full_response = c
+                .pull_blob_stream_partial(&reference, layer0, 0, Some(layer0.size as u64))
+                .await
+                .expect("failed to pull blob stream");
+
+            let layer_stream_partial = match partial_response {
+                BlobResponse::Full(_stream) => panic!("expected partial response"),
+                BlobResponse::Partial(stream) => stream,
+            };
+            assert_eq!(layer_stream_partial.content_length, Some(length));
+            AsyncReadExt::read_to_end(
+                &mut StreamReader::new(layer_stream_partial.stream),
+                &mut partial_file,
+            )
+            .await
+            .unwrap();
+
+            // Also pull the full layer into a separate file to compare with the partial.
+            let mut full_file: Vec<u8> = Vec::new();
+            let layer_stream_full = match full_response {
+                BlobResponse::Full(_stream) => panic!("expected partial response"),
+                BlobResponse::Partial(stream) => stream,
+            };
+            assert_eq!(layer_stream_full.content_length, Some(layer0.size as u64));
+            AsyncReadExt::read_to_end(
+                &mut StreamReader::new(layer_stream_full.stream),
+                &mut full_file,
+            )
+            .await
+            .unwrap();
+
+            // The partial read length says how many bytes we should expect.
+            assert_eq!(partial_file.len(), length as usize);
+            // The manifest says how many bytes we should expect on a full read.
+            assert_eq!(full_file.len(), layer0.size as usize);
+            // Check that the partial read retrieved the correct bytes.
+            let end: usize = (offset + length) as usize;
+            assert_eq!(partial_file, full_file[offset as usize..end]);
         }
     }
 
@@ -2518,10 +3382,7 @@ mod test {
                         break;
                     }
                     Err(e) => {
-                        println!(
-                            "Got error on pull call attempt {}. Will retry in 1s: {:?}",
-                            i, e
-                        );
+                        println!("Got error on pull call attempt {i}. Will retry in 1s: {e:?}");
                         last_error.replace(e);
                         tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
                     }
@@ -2529,7 +3390,7 @@ mod test {
             }
 
             if let Some(e) = last_error {
-                panic!("Unable to pull layer: {:?}", e);
+                panic!("Unable to pull layer: {e:?}");
             }
 
             assert!(image_data.is_some());
@@ -2581,27 +3442,32 @@ mod test {
     }
 
     #[cfg(feature = "test-registry")]
-    fn registry_image_basic_auth(auth_path: &str) -> GenericImage {
+    fn registry_image_basic_auth(auth_path: &str) -> ContainerRequest<GenericImage> {
         GenericImage::new("docker.io/library/registry", "2")
+            .with_wait_for(WaitFor::message_on_stderr("listening on "))
             .with_env_var("REGISTRY_AUTH", "htpasswd")
             .with_env_var("REGISTRY_AUTH_HTPASSWD_REALM", "Registry Realm")
             .with_env_var("REGISTRY_AUTH_HTPASSWD_PATH", "/auth/htpasswd")
-            .with_volume(auth_path, "/auth")
-            .with_wait_for(WaitFor::message_on_stderr("listening on "))
+            .with_mount(Mount::bind_mount(auth_path, "/auth"))
     }
 
     #[tokio::test]
     #[cfg(feature = "test-registry")]
     async fn can_push_chunk() {
-        let docker = clients::Cli::default();
-        let test_container = docker.run(registry_image());
-        let port = test_container.get_host_port_ipv4(5000);
+        let test_container = registry_image()
+            .start()
+            .await
+            .expect("Failed to start registry container");
+        let port = test_container
+            .get_host_port_ipv4(5000)
+            .await
+            .expect("Failed to get port");
 
         let c = Client::new(ClientConfig {
             protocol: ClientProtocol::Http,
             ..Default::default()
         });
-        let url = format!("localhost:{}/hello-wasm:v1", port);
+        let url = format!("localhost:{port}/hello-wasm:v1");
         let image: Reference = url.parse().unwrap();
 
         c.auth(&image, &RegistryAuth::Anonymous, RegistryOperation::Push)
@@ -2613,34 +3479,35 @@ mod test {
             .await
             .expect("failed to begin push session");
 
-        let image_data: Vec<Vec<u8>> = vec![b"iamawebassemblymodule".to_vec()];
-
+        let image_data = Bytes::from(b"iamawebassemblymodule".to_vec());
         let (next_location, next_byte) = c
-            .push_chunk(&location, &image, &image_data[0], 0)
+            .push_chunk(&location, &image, image_data.clone(), 0)
             .await
             .expect("failed to push layer");
 
         // Location should include original URL with at session ID appended
         assert!(next_location.len() >= url.len() + "6987887f-0196-45ee-91a1-2dfad901bea0".len());
-        assert_eq!(
-            next_byte,
-            "iamawebassemblymodule".to_string().into_bytes().len()
-        );
+        assert_eq!(next_byte, image_data.len());
 
         let layer_location = c
-            .end_push_chunked_session(&next_location, &image, &sha256_digest(&image_data[0]))
+            .end_push_chunked_session(&next_location, &image, &sha256_digest(&image_data))
             .await
             .expect("failed to end push session");
 
-        assert_eq!(layer_location, format!("http://localhost:{}/v2/hello-wasm/blobs/sha256:6165c4ad43c0803798b6f2e49d6348c915d52c999a5f890846cee77ea65d230b", port));
+        assert_eq!(layer_location, format!("http://localhost:{port}/v2/hello-wasm/blobs/sha256:6165c4ad43c0803798b6f2e49d6348c915d52c999a5f890846cee77ea65d230b"));
     }
 
     #[tokio::test]
     #[cfg(feature = "test-registry")]
     async fn can_push_multiple_chunks() {
-        let docker = clients::Cli::default();
-        let test_container = docker.run(registry_image());
-        let port = test_container.get_host_port_ipv4(5000);
+        let test_container = registry_image()
+            .start()
+            .await
+            .expect("Failed to start registry container");
+        let port = test_container
+            .get_host_port_ipv4(5000)
+            .await
+            .expect("Failed to get port");
 
         let mut c = Client::new(ClientConfig {
             protocol: ClientProtocol::Http,
@@ -2648,7 +3515,7 @@ mod test {
         });
         // set a super small chunk size - done to force multiple pushes
         c.push_chunk_size = 3;
-        let url = format!("localhost:{}/hello-wasm:v1", port);
+        let url = format!("localhost:{port}/hello-wasm:v1");
         let image: Reference = url.parse().unwrap();
 
         c.auth(&image, &RegistryAuth::Anonymous, RegistryOperation::Push)
@@ -2660,24 +3527,23 @@ mod test {
         let image_digest = sha256_digest(&image_data);
 
         let location = c
-            .push_blob_chunked(&image, &image_data, &image_digest)
+            .push_blob_chunked(&image, image_data, &image_digest)
             .await
             .expect("failed to begin push session");
 
         assert_eq!(
             location,
-            format!(
-                "http://localhost:{}/v2/hello-wasm/blobs/{}",
-                port, image_digest
-            )
+            format!("http://localhost:{port}/v2/hello-wasm/blobs/{image_digest}")
         );
     }
 
     #[tokio::test]
     #[cfg(feature = "test-registry")]
     async fn test_image_roundtrip_anon_auth() {
-        let docker = clients::Cli::default();
-        let test_container = docker.run(registry_image());
+        let test_container = registry_image()
+            .start()
+            .await
+            .expect("Failed to start registry container");
 
         test_image_roundtrip(&RegistryAuth::Anonymous, &test_container).await;
     }
@@ -2689,14 +3555,13 @@ mod test {
         let htpasswd_path = path::Path::join(auth_dir.path(), "htpasswd");
         fs::write(htpasswd_path, HTPASSWD).expect("cannot write htpasswd file");
 
-        let docker = clients::Cli::default();
         let image = registry_image_basic_auth(
             auth_dir
                 .path()
                 .to_str()
                 .expect("cannot convert htpasswd_path to string"),
         );
-        let test_container = docker.run(image);
+        let test_container = image.start().await.expect("cannot registry container");
 
         let auth =
             RegistryAuth::Basic(HTPASSWD_USERNAME.to_string(), HTPASSWD_PASSWORD.to_string());
@@ -2707,10 +3572,13 @@ mod test {
     #[cfg(feature = "test-registry")]
     async fn test_image_roundtrip(
         registry_auth: &RegistryAuth,
-        test_container: &testcontainers::Container<'_, GenericImage>,
+        test_container: &testcontainers::ContainerAsync<GenericImage>,
     ) {
         let _ = tracing_subscriber::fmt::try_init();
-        let port = test_container.get_host_port_ipv4(5000);
+        let port = test_container
+            .get_host_port_ipv4(5000)
+            .await
+            .expect("Failed to get port");
 
         let c = Client::new(ClientConfig {
             protocol: ClientProtocol::HttpsExcept(vec![format!("localhost:{}", port)]),
@@ -2733,7 +3601,7 @@ mod test {
             .await
             .expect("failed to pull image");
 
-        let push_image: Reference = format!("localhost:{}/hello-wasm:v1", port).parse().unwrap();
+        let push_image: Reference = format!("localhost:{port}/hello-wasm:v1").parse().unwrap();
         c.auth(&push_image, registry_auth, RegistryOperation::Push)
             .await
             .expect("authenticated");
@@ -2798,7 +3666,7 @@ mod test {
 
         // Compute the digest of the returned manifest text.
         let digest = sha2::Sha256::digest(manifest);
-        let hex = format!("sha256:{:x}", digest);
+        let hex = format!("sha256:{}", hex::encode(digest));
 
         // Validate that the computed digest and the digest in the pulled reference match.
         assert_eq!(image.digest().unwrap(), hex);
@@ -2808,9 +3676,14 @@ mod test {
     #[cfg(feature = "test-registry")]
     async fn test_mount() {
         // initialize the registry
-        let docker = clients::Cli::default();
-        let test_container = docker.run(registry_image());
-        let port = test_container.get_host_port_ipv4(5000);
+        let test_container = registry_image()
+            .start()
+            .await
+            .expect("Failed to start registry");
+        let port = test_container
+            .get_host_port_ipv4(5000)
+            .await
+            .expect("Failed to get port");
 
         let c = Client::new(ClientConfig {
             protocol: ClientProtocol::HttpsExcept(vec![format!("localhost:{}", port)]),
@@ -2818,7 +3691,7 @@ mod test {
         });
 
         // Create a dummy layer and push it to `layer-repository`
-        let layer_reference: Reference = format!("localhost:{}/layer-repository", port)
+        let layer_reference: Reference = format!("localhost:{port}/layer-repository")
             .parse()
             .unwrap();
         let layer_data = vec![1u8, 2, 3, 4];
@@ -2826,12 +3699,16 @@ mod test {
             digest: sha256_digest(&layer_data),
             ..Default::default()
         };
-        c.push_blob(&layer_reference, &[1, 2, 3, 4], &layer.digest)
-            .await
-            .expect("Failed to push");
+        c.push_blob(
+            &layer_reference,
+            Bytes::copy_from_slice(&layer_data),
+            &layer.digest,
+        )
+        .await
+        .expect("Failed to push");
 
         // Mount the layer at `image-repository`
-        let image_reference: Reference = format!("localhost:{}/image-repository", port)
+        let image_reference: Reference = format!("localhost:{port}/image-repository")
             .parse()
             .unwrap();
         c.mount_blob(&image_reference, &layer_reference, &layer.digest)
@@ -2860,7 +3737,7 @@ mod test {
             .await
             .unwrap_err();
         assert_eq!(
-            format!("{}", err),
+            format!("{err}"),
             "Received Image Index/Manifest List, but platform_resolver was not defined on the client config. Consider setting platform_resolver"
         );
 
@@ -2939,7 +3816,7 @@ mod test {
         // First two should be identical; others differ
         let image_layers = Vec::from([
             ImageLayer {
-                data: Vec::from([0, 1, 2, 3]),
+                data: Bytes::from_static(&[0, 1, 2, 3]),
                 media_type: "media_type".to_owned(),
                 annotations: Some(BTreeMap::from([
                     ("0".to_owned(), "1".to_owned()),
@@ -2947,7 +3824,7 @@ mod test {
                 ])),
             },
             ImageLayer {
-                data: Vec::from([0, 1, 2, 3]),
+                data: Bytes::from_static(&[0, 1, 2, 3]),
                 media_type: "media_type".to_owned(),
                 annotations: Some(BTreeMap::from([
                     ("2".to_owned(), "3".to_owned()),
@@ -2955,7 +3832,7 @@ mod test {
                 ])),
             },
             ImageLayer {
-                data: Vec::from([0, 1, 2, 3]),
+                data: Bytes::from_static(&[0, 1, 2, 3]),
                 media_type: "different_media_type".to_owned(),
                 annotations: Some(BTreeMap::from([
                     ("0".to_owned(), "1".to_owned()),
@@ -2963,7 +3840,7 @@ mod test {
                 ])),
             },
             ImageLayer {
-                data: Vec::from([0, 1, 2]),
+                data: Bytes::from_static(&[0, 1, 2]),
                 media_type: "media_type".to_owned(),
                 annotations: Some(BTreeMap::from([
                     ("0".to_owned(), "1".to_owned()),
@@ -2971,7 +3848,7 @@ mod test {
                 ])),
             },
             ImageLayer {
-                data: Vec::from([0, 1, 2, 3]),
+                data: Bytes::from_static(&[0, 1, 2, 3]),
                 media_type: "media_type".to_owned(),
                 annotations: Some(BTreeMap::from([
                     ("1".to_owned(), "0".to_owned()),
@@ -3014,6 +3891,350 @@ mod test {
             image_layers.len() - 1,
             deduped.len(),
             "after deduplication, there should be one less image layer"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "test-registry")]
+    async fn test_blob_exists() {
+        let real_registry = registry_image_edge()
+            .start()
+            .await
+            .expect("Failed to start registry container");
+
+        let server_port = real_registry
+            .get_host_port_ipv4(5000)
+            .await
+            .expect("Failed to get port");
+
+        let client = Client::new(ClientConfig {
+            protocol: ClientProtocol::HttpsExcept(vec![format!("localhost:{}", server_port)]),
+            ..Default::default()
+        });
+
+        let reference = Reference::try_from(format!("localhost:{server_port}/empty"))
+            .expect("failed to parse reference");
+
+        assert!(!client
+            .blob_exists(&reference, EMPTY_JSON_DIGEST)
+            .await
+            .expect("failed to check blob existence"));
+        client
+            .push_blob(&reference, EMPTY_JSON_BLOB.as_bytes(), EMPTY_JSON_DIGEST)
+            .await
+            .expect("failed to push empty json blob");
+        assert!(client
+            .blob_exists(&reference, EMPTY_JSON_DIGEST)
+            .await
+            .expect("failed to check blob existence"));
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "test-registry")]
+    async fn test_push_stream() {
+        let real_registry = registry_image_edge()
+            .start()
+            .await
+            .expect("Failed to start registry container");
+
+        let server_port = real_registry
+            .get_host_port_ipv4(5000)
+            .await
+            .expect("Failed to get port");
+
+        let mut client = Client::new(ClientConfig {
+            protocol: ClientProtocol::HttpsExcept(vec![format!("localhost:{}", server_port)]),
+            ..Default::default()
+        });
+        client.push_chunk_size = 253;
+
+        // hash for a byte array counting 16 times from 0 to 255 ([0, 1. 2...., 255] * 16)
+        let data_hash = "sha256:c8f5d0341d54d951a71b136e6e2afcb14d11ed8489a7ae126a8fee0df6ecf193";
+        let data_stream = |repeat| {
+            futures_util::stream::repeat(Bytes::from_iter(0..=255))
+                .take(repeat)
+                .map(Ok)
+        };
+
+        let reference = Reference::try_from(format!("localhost:{server_port}/test-push-stream"))
+            .expect("failed to parse reference");
+
+        // Sanity check: verify that the server rejects the push if the blob has a mismatched digest
+        client
+            .push_blob_stream(&reference, data_stream(1), data_hash)
+            .await
+            .expect_err("expected push to fail with mismatched digest");
+
+        // Now push the stream with the correct digest
+        client
+            .push_blob_stream(&reference, data_stream(16), data_hash)
+            .await
+            .expect("failed to push stream");
+
+        assert!(client
+            .blob_exists(&reference, data_hash)
+            .await
+            .expect("failed to check blob existence"));
+    }
+
+    /// Push a minimal OCI image manifest (empty config blob, no layers) to the registry and
+    /// return its digest.
+    ///
+    /// The manifest is pushed under the given `reference`.  The caller is responsible for
+    /// authenticating the client for push operations beforehand.
+    #[cfg(feature = "test-registry")]
+    async fn push_minimal_manifest(
+        client: &Client,
+        reference: &Reference,
+        artifact_type: Option<&str>,
+    ) -> String {
+        // Empty config blob.
+        let config_data = b"{}";
+        let config_digest = sha256_digest(config_data);
+        client
+            .push_blob(reference, config_data.as_slice(), &config_digest)
+            .await
+            .expect("failed to push config blob");
+
+        let manifest = OciImageManifest {
+            schema_version: 2,
+            media_type: Some(manifest::OCI_IMAGE_MEDIA_TYPE.to_string()),
+            artifact_type: artifact_type.map(str::to_string),
+            config: OciDescriptor {
+                media_type: manifest::IMAGE_CONFIG_MEDIA_TYPE.to_string(),
+                digest: config_digest.clone(),
+                size: config_data.len() as i64,
+                ..Default::default()
+            },
+            layers: vec![],
+            subject: None,
+            annotations: None,
+        };
+
+        let oci_manifest = OciManifest::Image(manifest);
+        client
+            .push_manifest(reference, &oci_manifest)
+            .await
+            .expect("failed to push manifest")
+            // push_manifest returns the URL; extract the digest from the end
+            .rsplit('/')
+            .next()
+            .expect("manifest URL has no digest component")
+            .to_string()
+    }
+
+    /// `distribution/distribution` does not implement the native OCI referrers API — it returns 404 for
+    /// `/v2/<name>/referrers/<digest>`.  These tests verify that `pull_referrers` correctly
+    /// falls back to the referrers tag schema in that situation.
+    ///
+    /// Referrers support is being tracked upstream by this issue: https://github.com/distribution/distribution/issues/3716
+    ///
+    /// Setup overview:
+    ///   1. Push a "target" image manifest to get its digest.
+    ///   2. Manually build and push an `OciImageIndex` as the referrers tag
+    ///      (`sha256-<target-digest>`), containing descriptor entries for two
+    ///      hypothetical referrers with different `artifact_type` values.
+    ///   3. Call `pull_referrers` and verify that the fallback is used and the
+    ///      returned index contains the expected entries (both unfiltered and filtered).
+    #[tokio::test]
+    #[cfg(feature = "test-registry")]
+    async fn test_pull_referrers_with_tag_schema_fallback() {
+        let test_container = registry_image()
+            .start()
+            .await
+            .expect("Failed to start registry container");
+        let port = test_container
+            .get_host_port_ipv4(5000)
+            .await
+            .expect("Failed to get port");
+
+        let client = Client::new(ClientConfig {
+            protocol: ClientProtocol::HttpsExcept(vec![format!("localhost:{port}")]),
+            ..Default::default()
+        });
+
+        let repo = format!("localhost:{port}/referrers-test");
+
+        // --- Step 1: push the target manifest ---
+        let target_ref: Reference = format!("{repo}:target").parse().unwrap();
+        client
+            .auth(
+                &target_ref,
+                &RegistryAuth::Anonymous,
+                RegistryOperation::Push,
+            )
+            .await
+            .expect("failed to authenticate for push");
+        let target_digest = push_minimal_manifest(&client, &target_ref, None).await;
+
+        // --- Step 2: push a referrers tag index ---
+        //
+        // The tag is the target digest with ':' replaced by '-'.
+        // We include two descriptors so we can also test artifact_type filtering:
+        //   - one with artifact_type "application/vnd.test.sig"
+        //   - one with artifact_type "application/vnd.test.sbom"
+        const SIG_ARTIFACT_TYPE: &str = "application/vnd.test.sig";
+        const SBOM_ARTIFACT_TYPE: &str = "application/vnd.test.sbom";
+
+        // Push two real minimal manifests to use as referrer entries.
+        let sig_ref: Reference = format!("{repo}:sig").parse().unwrap();
+        let sig_digest = push_minimal_manifest(&client, &sig_ref, Some(SIG_ARTIFACT_TYPE)).await;
+
+        let sbom_ref: Reference = format!("{repo}:sbom").parse().unwrap();
+        let sbom_digest = push_minimal_manifest(&client, &sbom_ref, Some(SBOM_ARTIFACT_TYPE)).await;
+
+        // Pull the manifests back to get the accurate serialised sizes.
+        let (sig_raw, _) = client
+            .pull_manifest_raw(
+                &sig_ref,
+                &RegistryAuth::Anonymous,
+                MIME_TYPES_DISTRIBUTION_MANIFEST,
+            )
+            .await
+            .expect("failed to pull sig manifest raw");
+        let sig_size = sig_raw.len() as i64;
+
+        let (sbom_raw, _) = client
+            .pull_manifest_raw(
+                &sbom_ref,
+                &RegistryAuth::Anonymous,
+                MIME_TYPES_DISTRIBUTION_MANIFEST,
+            )
+            .await
+            .expect("failed to pull sbom manifest raw");
+        let sbom_size = sbom_raw.len() as i64;
+
+        let referrers_index = OciImageIndex {
+            schema_version: 2,
+            media_type: Some(manifest::OCI_IMAGE_INDEX_MEDIA_TYPE.to_string()),
+            artifact_type: None,
+            annotations: None,
+            manifests: vec![
+                ImageIndexEntry {
+                    media_type: manifest::OCI_IMAGE_MEDIA_TYPE.to_string(),
+                    digest: sig_digest,
+                    size: sig_size,
+                    artifact_type: Some(SIG_ARTIFACT_TYPE.to_string()),
+                    platform: None,
+                    annotations: None,
+                },
+                ImageIndexEntry {
+                    media_type: manifest::OCI_IMAGE_MEDIA_TYPE.to_string(),
+                    digest: sbom_digest,
+                    size: sbom_size,
+                    artifact_type: Some(SBOM_ARTIFACT_TYPE.to_string()),
+                    platform: None,
+                    annotations: None,
+                },
+            ],
+        };
+
+        let fallback_tag = target_digest.replace(':', "-");
+        let tag_ref: Reference = format!("{repo}:{fallback_tag}").parse().unwrap();
+        client
+            .push_manifest(&tag_ref, &OciManifest::ImageIndex(referrers_index))
+            .await
+            .expect("failed to push referrers tag index");
+
+        // --- Step 3: pull_referrers — no filter, expect both entries ---
+        let digest_ref = Reference::with_digest(
+            format!("localhost:{port}"),
+            "referrers-test".to_string(),
+            target_digest.clone(),
+        );
+        client
+            .auth(
+                &digest_ref,
+                &RegistryAuth::Anonymous,
+                RegistryOperation::Pull,
+            )
+            .await
+            .expect("failed to authenticate for pull");
+
+        let index = client
+            .pull_referrers(&digest_ref, None)
+            .await
+            .expect("pull_referrers failed");
+        assert_eq!(
+            index.manifests.len(),
+            2,
+            "expected 2 referrers (unfiltered), got {:?}",
+            index.manifests
+        );
+
+        // --- Step 4: pull_referrers — filtered by SIG_ARTIFACT_TYPE ---
+        let index_filtered = client
+            .pull_referrers(&digest_ref, Some(SIG_ARTIFACT_TYPE))
+            .await
+            .expect("pull_referrers with artifact_type filter failed");
+        assert_eq!(
+            index_filtered.manifests.len(),
+            1,
+            "expected 1 referrer after filtering by {SIG_ARTIFACT_TYPE}, got {:?}",
+            index_filtered.manifests
+        );
+        assert_eq!(
+            index_filtered.manifests[0].artifact_type.as_deref(),
+            Some(SIG_ARTIFACT_TYPE),
+        );
+    }
+
+    /// Verify that `pull_referrers` returns an empty index when neither the native referrers
+    /// API nor the referrers tag schema returns anything — i.e. the target image exists but
+    /// has no referrers at all.
+    #[tokio::test]
+    #[cfg(feature = "test-registry")]
+    async fn test_pull_referrers_no_tag_schema() {
+        let test_container = registry_image()
+            .start()
+            .await
+            .expect("Failed to start registry container");
+        let port = test_container
+            .get_host_port_ipv4(5000)
+            .await
+            .expect("Failed to get port");
+
+        let client = Client::new(ClientConfig {
+            protocol: ClientProtocol::HttpsExcept(vec![format!("localhost:{port}")]),
+            ..Default::default()
+        });
+
+        let repo = format!("localhost:{port}/referrers-none-test");
+
+        // Push a target manifest — but do NOT push any referrers tag.
+        let target_ref: Reference = format!("{repo}:target").parse().unwrap();
+        client
+            .auth(
+                &target_ref,
+                &RegistryAuth::Anonymous,
+                RegistryOperation::Push,
+            )
+            .await
+            .expect("failed to authenticate for push");
+        let target_digest = push_minimal_manifest(&client, &target_ref, None).await;
+
+        let digest_ref = Reference::with_digest(
+            format!("localhost:{port}"),
+            "referrers-none-test".to_string(),
+            target_digest,
+        );
+        client
+            .auth(
+                &digest_ref,
+                &RegistryAuth::Anonymous,
+                RegistryOperation::Pull,
+            )
+            .await
+            .expect("failed to authenticate for pull");
+
+        let index = client
+            .pull_referrers(&digest_ref, None)
+            .await
+            .expect("pull_referrers should succeed (returning empty index)");
+        assert!(
+            index.manifests.is_empty(),
+            "expected empty referrers index, got {:?}",
+            index.manifests
         );
     }
 }

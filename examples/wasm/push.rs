@@ -1,4 +1,4 @@
-use oci_distribution::{
+use oci_client::{
     client::{Config, ImageLayer},
     manifest,
     secrets::RegistryAuth,
@@ -16,7 +16,7 @@ pub(crate) async fn push_wasm(
 ) {
     info!(?reference, ?module, "pushing wasm module");
 
-    let data = async_std::fs::read(module)
+    let data = tokio::fs::read(module)
         .await
         .expect("Cannot read Wasm module from disk");
 
@@ -27,7 +27,7 @@ pub(crate) async fn push_wasm(
     )];
 
     let config = Config {
-        data: b"{}".to_vec(),
+        data: bytes::Bytes::from_static(b"{}"),
         media_type: manifest::WASM_CONFIG_MEDIA_TYPE.to_string(),
         annotations: None,
     };
@@ -40,5 +40,5 @@ pub(crate) async fn push_wasm(
         .map(|push_response| push_response.manifest_url)
         .expect("Cannot push Wasm module");
 
-    println!("Wasm module successfully pushed {:?}", response);
+    println!("Wasm module successfully pushed {response:?}");
 }

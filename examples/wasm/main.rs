@@ -1,4 +1,4 @@
-use oci_distribution::{annotations, secrets::RegistryAuth, Client, Reference};
+use oci_client::{annotations, secrets::RegistryAuth, Client, Reference};
 
 use docker_credential::{CredentialRetrievalError, DockerCredential};
 use std::collections::BTreeMap;
@@ -29,7 +29,7 @@ fn build_auth(reference: &Reference, cli: &Cli) -> RegistryAuth {
     match docker_credential::get_credential(server) {
         Err(CredentialRetrievalError::ConfigNotFound) => RegistryAuth::Anonymous,
         Err(CredentialRetrievalError::NoCredentialConfigured) => RegistryAuth::Anonymous,
-        Err(e) => panic!("Error handling docker configuration file: {}", e),
+        Err(e) => panic!("Error handling docker configuration file: {e}"),
         Ok(DockerCredential::UsernamePassword(username, password)) => {
             debug!("Found docker credentials");
             RegistryAuth::Basic(username, password)
@@ -41,14 +41,14 @@ fn build_auth(reference: &Reference, cli: &Cli) -> RegistryAuth {
     }
 }
 
-fn build_client_config(cli: &Cli) -> oci_distribution::client::ClientConfig {
+fn build_client_config(cli: &Cli) -> oci_client::client::ClientConfig {
     let protocol = if cli.insecure {
-        oci_distribution::client::ClientProtocol::Http
+        oci_client::client::ClientProtocol::Http
     } else {
-        oci_distribution::client::ClientProtocol::Https
+        oci_client::client::ClientProtocol::Https
     };
 
-    oci_distribution::client::ClientConfig {
+    oci_client::client::ClientConfig {
         protocol,
         ..Default::default()
     }

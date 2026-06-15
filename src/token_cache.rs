@@ -1,6 +1,4 @@
-//! Types for working with registry auth tokens
-
-use crate::reference::Reference;
+use oci_spec::distribution::Reference;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::fmt;
@@ -73,6 +71,11 @@ pub enum RegistryOperation {
     Pull,
 }
 
+#[derive(Debug, Deserialize)]
+struct BearerTokenClaims {
+    exp: Option<u64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct TokenCacheKey {
     registry: String,
@@ -112,37 +115,10 @@ impl TokenCache {
         let expiration = match token {
             RegistryTokenType::Basic(_, _) => u64::MAX,
             RegistryTokenType::Bearer(ref t) => {
-                let token_str = t.token();
-                match jwt::Token::<
-                        jwt::header::Header,
-                        jwt::claims::Claims,
-                        jwt::token::Unverified,
-                    >::parse_unverified(token_str)
-                    {
-                        Ok(token) => token.claims().registered.expiration.unwrap_or(u64::MAX),
-                        Err(jwt::Error::NoClaimsComponent) => {
-                            // the token doesn't have a claim that states a
-                            // value for the expiration. We assume it has a 60
-                            // seconds validity as indicated here:
-                            // https://docs.docker.com/registry/spec/auth/token/#requesting-a-token
-                            // > (Optional) The duration in seconds since the token was issued
-                            // > that it will remain valid. When omitted, this defaults to 60 seconds.
-                            // > For compatibility with older clients, a token should never be returned
-                            // > with less than 60 seconds to live.
-                            let now = SystemTime::now();
-                            let epoch = now
-                                .duration_since(UNIX_EPOCH)
-                                .expect("Time went backwards")
-                                .as_secs();
-                            let expiration = epoch + self.default_expiration_secs as u64;
-                            debug!(?token, "Cannot extract expiration from token's claims, assuming a {} seconds validity", self.default_expiration_secs);
-                            expiration
-                        },
-                        Err(error) => {
-                            warn!(?error, "Invalid bearer token");
-                            return;
-                        }
-                    }
+                match parse_expiration_from_jwt(t.token(), self.default_expiration_secs) {
+                    Some(value) => value,
+                    None => return,
+                }
             }
         };
         let registry = reference.resolve_registry().to_string();
@@ -193,5 +169,158 @@ impl TokenCache {
                 None
             }
         }
+    }
+}
+
+fn parse_expiration_from_jwt(token_str: &str, default_expiration_secs: usize) -> Option<u64> {
+    match jsonwebtoken::dangerous::insecure_decode::<BearerTokenClaims>(token_str) {
+        Ok(token) => {
+            let token_exp = match token.claims.exp {
+                Some(exp) => exp,
+                None => {
+                    // the token doesn't have a claim that states a
+                    // value for the expiration. We assume it has a 60
+                    // seconds validity as indicated here:
+                    // https://docs.docker.com/reference/api/registry/auth/#token-response-fields
+                    // > (Optional) The duration in seconds since the token was issued
+                    // > that it will remain valid. When omitted, this defaults to 60 seconds.
+                    // > For compatibility with older clients, a token should never be returned
+                    // > with less than 60 seconds to live.
+                    let now = SystemTime::now();
+                    let epoch = now
+                        .duration_since(UNIX_EPOCH)
+                        .expect("Time went backwards")
+                        .as_secs();
+                    let expiration = epoch + default_expiration_secs as u64;
+                    debug!(?token, "Cannot extract expiration from token's claims, assuming a {} seconds validity", default_expiration_secs);
+                    expiration
+                }
+            };
+
+            Some(token_exp)
+        }
+        Err(error) if error.kind() == &jsonwebtoken::errors::ErrorKind::InvalidToken => {
+            // The token is not a JWT (e.g., an opaque token issued by registries
+            // like GHCR). Use the default expiration as a best-effort assumption,
+            // mirroring the behaviour for JWT tokens that carry no `exp` claim.
+            let epoch = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("Time went backwards")
+                .as_secs();
+            debug!(
+                "Bearer token is not a JWT, assuming a {} seconds validity",
+                default_expiration_secs
+            );
+            Some(epoch + default_expiration_secs as u64)
+        }
+        Err(error) => {
+            warn!(?error, "Invalid bearer token");
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use jsonwebtoken::{EncodingKey, Header};
+    use oci_spec::distribution::Reference;
+    use serde::Serialize;
+
+    // An opaque token as issued by registries like GHCR — not a JWT.
+    const OPAQUE_TOKEN: &str = "ghs_exampleOpaqueTokenFromGHCR1234567890";
+
+    #[derive(Serialize)]
+    struct ClaimsWithExp {
+        exp: u64,
+    }
+
+    #[derive(Serialize)]
+    struct ClaimsWithoutExp {
+        sub: &'static str,
+    }
+
+    fn make_jwt_with_exp(exp: u64) -> String {
+        jsonwebtoken::encode(
+            &Header::default(),
+            &ClaimsWithExp { exp },
+            &EncodingKey::from_secret(b"secret"),
+        )
+        .expect("failed to encode JWT with exp")
+    }
+
+    fn make_jwt_without_exp() -> String {
+        jsonwebtoken::encode(
+            &Header::default(),
+            &ClaimsWithoutExp { sub: "test" },
+            &EncodingKey::from_secret(b"secret"),
+        )
+        .expect("failed to encode JWT without exp")
+    }
+
+    #[test]
+    fn jwt_with_exp_uses_claims_expiration() {
+        crate::test_helpers::jsonwebtoken_install_default_crypto_provider();
+        let token = make_jwt_with_exp(9999999999);
+        let exp = parse_expiration_from_jwt(&token, 60)
+            .expect("should return Some for valid JWT with exp");
+        assert_eq!(exp, 9999999999);
+    }
+
+    #[test]
+    fn jwt_without_exp_uses_default_expiration() {
+        crate::test_helpers::jsonwebtoken_install_default_crypto_provider();
+        let token = make_jwt_without_exp();
+        let before = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let exp =
+            parse_expiration_from_jwt(&token, 60).expect("should return Some for JWT without exp");
+        let after = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert!(exp >= before + 60);
+        assert!(exp <= after + 60);
+    }
+
+    #[test]
+    fn opaque_token_uses_default_expiration() {
+        let before = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let exp = parse_expiration_from_jwt(OPAQUE_TOKEN, 60)
+            .expect("opaque token should return Some with default expiration");
+        let after = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert!(exp >= before + 60);
+        assert!(exp <= after + 60);
+    }
+
+    #[tokio::test]
+    async fn opaque_token_is_cached() {
+        let cache = TokenCache::new(60);
+        let reference: Reference = "ghcr.io/kubewarden/policies/pod-privileged:v1.0.10"
+            .parse()
+            .unwrap();
+        let token = RegistryTokenType::Bearer(RegistryToken::Token {
+            token: OPAQUE_TOKEN.to_string(),
+        });
+
+        cache
+            .insert(&reference, RegistryOperation::Pull, token)
+            .await;
+
+        assert!(
+            cache
+                .get(&reference, RegistryOperation::Pull)
+                .await
+                .is_some(),
+            "opaque bearer token should be cached"
+        );
     }
 }
