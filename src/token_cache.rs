@@ -1,3 +1,4 @@
+//! Token cache for OCI registry authentication
 use oci_spec::distribution::Reference;
 use serde::Deserialize;
 use std::collections::BTreeMap;
